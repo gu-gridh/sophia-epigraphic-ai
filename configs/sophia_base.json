@@ -1,0 +1,88 @@
+{
+  "experiment_name": "sophia_base_v1",
+  "use_wandb": true,
+  
+  "model": {
+    "vision": {
+      "backbone": "resnet50",
+      "hidden_size": 768,
+      "dropout": 0.1
+    },
+    "text": {
+      "model_name": "xlm-roberta-base",
+      "hidden_size": 768,
+      "char_embedding_size": 64,
+      "char_hidden_size": 128,
+      "dropout": 0.1
+    },
+    "spatial": {
+      "hidden_size": 768,
+      "bbox_hidden_size": 128,
+      "geometry_embedding_size": 64,
+      "num_heads": 8,
+      "num_layers": 2,
+      "ff_size": 2048,
+      "dropout": 0.1
+    },
+    "fusion": {
+      "hidden_size": 768,
+      "dropout": 0.1
+    },
+    "decoder": {
+      "hidden_size": 768,
+      "num_heads": 8,
+      "num_layers": 6,
+      "ff_size": 2048,
+      "dropout": 0.1
+    }
+  },
+  
+  "vocab_size": 50000,
+  "max_sequence_length": 512,
+  
+  "optimizer": {
+    "type": "adamw",
+    "lr": 5e-4,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999]
+  },
+  
+  "scheduler": {
+    "type": "cosine",
+    "T_max": 100,
+    "eta_min": 1e-6
+  },
+  
+  "training": {
+    "num_epochs": 100,
+    "batch_size": 16,
+    "num_workers": 4,
+    "grad_clip_norm": 1.0,
+    "log_interval": 100,
+    "save_interval": 10
+  },
+  
+  "loss_weights": {
+    "transcription_weight": 1.0,
+    "restoration_weight": 0.1,
+    "dating_weight": 0.1
+  },
+  
+  "data": {
+    "train_csv": "./data/train_dataset.csv",
+    "val_csv": "./data/val_dataset.csv",
+    "test_csv": "./data/test_dataset.csv",
+    "images_dir": "./data/images",
+    "annotations_dir": "./data/annotations",
+    "image_size": [224, 224],
+    "max_text_length": 512
+  },
+  
+  "checkpoint_dir": "./checkpoints",
+  
+  "inference": {
+    "beam_size": 5,
+    "max_length": 512,
+    "temperature": 1.0
+  }
+}
