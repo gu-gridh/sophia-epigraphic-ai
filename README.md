@@ -1,6 +1,6 @@
 # SOPHIA - Epigraphic AI
 
-Multimodal deep learning framework for reading ancient inscriptions from Saint Sophia Cathedral in Kyiv, Ukraine. This tool combines computer vision with spatial annotation data to automatically transcribe Byzantine graffiti and historical texts, advancing digital humanities research through AI-powered archaeological text recognition.
+Multimodal deep learning framework for reading ancient inscriptions from Saint Sophia Cathedral in Kyiv, Ukraine. This tool combines computer vision with spatial annotation data to automatically transcribe  graffiti and historical texts, advancing digital humanities research through AI-powered archaeological text recognition.
 
 ## Overview
 
