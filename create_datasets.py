@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 import os
+import re
 
 def parse_position(pos_str):
     """
@@ -30,6 +31,40 @@ def parse_position(pos_str):
     except:
         return None, None, None, None
     return None, None, None, None
+
+def clean_transcription(text):
+    """
+    Clean HTML tags and formatting from transcription text.
+    
+    Args:
+        text: Raw transcription text with HTML tags
+        
+    Returns:
+        str: Clean text without HTML tags and extra whitespace
+    """
+    if pd.isna(text) or text == '':
+        return ''
+    
+    # Remove HTML tags
+    clean_text = re.sub(r'<[^>]+>', '', str(text))
+    
+    # Remove common HTML entities
+    clean_text = clean_text.replace('&nbsp;', ' ')
+    clean_text = clean_text.replace('&amp;', '&')
+    clean_text = clean_text.replace('&lt;', '<')
+    clean_text = clean_text.replace('&gt;', '>')
+    clean_text = clean_text.replace('&quot;', '"')
+    
+    # Remove \r\n and extra whitespace
+    clean_text = clean_text.replace('\\r\\n', ' ')
+    clean_text = clean_text.replace('\r\n', ' ')
+    clean_text = clean_text.replace('\n', ' ')
+    clean_text = clean_text.replace('\r', ' ')
+    
+    # Clean up multiple spaces and strip
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    return clean_text
 
 def create_datasets(input_file='data/inscriptions_with_graffiti_data_20250811_124547.csv',
                    output_dir='data',
@@ -82,6 +117,20 @@ def create_datasets(input_file='data/inscriptions_with_graffiti_data_20250811_12
     dataset_filtered = dataset[valid_bbox & has_transcription].copy()
     
     print(f'After filtering (valid bbox + transcription): {len(dataset_filtered)}')
+    
+    # Clean transcription text (remove HTML tags)
+    print('Cleaning transcription text...')
+    dataset_filtered['transcription_clean'] = dataset_filtered['transcription'].apply(clean_transcription)
+    
+    # Update transcription column with cleaned version
+    dataset_filtered['transcription'] = dataset_filtered['transcription_clean']
+    dataset_filtered = dataset_filtered.drop('transcription_clean', axis=1)
+    
+    # Filter out empty transcriptions after cleaning
+    has_clean_transcription = dataset_filtered['transcription'] != ''
+    dataset_filtered = dataset_filtered[has_clean_transcription].copy()
+    
+    print(f'After cleaning transcription: {len(dataset_filtered)}')
     
     # Check stratification column
     if 'panel_room' in dataset_filtered.columns and dataset_filtered['panel_room'].notna().sum() > 0:
