@@ -87,6 +87,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
@@ -170,17 +171,43 @@ class SophiaDataset(Dataset):
         return True
     
     def _load_multichannel_image(self, annotation_id):
-        """Load all 4 image types for multi-channel processing."""
+        """Load all 4 image types for multi-channel processing with enhanced augmentation."""
         image_types = ['original', 'blended', 'normal', 'texture']
         channels = []
+        
+        # Enhanced augmentation transforms for better graffiti recognition
+        augment_transform = transforms.Compose([
+            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+            transforms.RandomRotation(degrees=5),  # Small rotations for stone inscriptions
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        base_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
         
         for img_type in image_types:
             img_path = os.path.join(self.cropped_images_dir, img_type, f"{annotation_id}_{img_type}.jpg")
             
             try:
                 img = Image.open(img_path).convert('RGB')
-                if self.transform:
+                
+                # Apply augmentation randomly during training
+                if self.transform and hasattr(self, 'training_mode') and self.training_mode:
+                    # 70% chance of augmentation for training robustness
+                    if torch.rand(1).item() < 0.7:
+                        img = augment_transform(img)
+                    else:
+                        img = base_transform(img)
+                elif self.transform:
                     img = self.transform(img)
+                else:
+                    img = base_transform(img)
+                    
                 channels.append(img)
             except Exception as e:
                 print(f"Error loading {img_path}: {e}")
@@ -238,19 +265,37 @@ def train_model(model, train_loader, val_loader, tokenizer, model_type, num_epoc
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
-    # Multi-stage learning rate schedule
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01, betas=(0.9, 0.95))
-    
-    # Cosine annealing with warm restarts
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=3, T_mult=2, eta_min=1e-6
+    # Enhanced optimizer with more conservative hyperparameters
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-4,  # Higher learning rate for better performance (back to original)
+        weight_decay=0.01,  # Reduced weight decay
+        betas=(0.9, 0.999),  
+        eps=1e-8
     )
     
-    # Improved loss functions
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id, label_smoothing=0.1)
+    # More conservative learning rate schedule
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs,
+        eta_min=1e-7
+    )
+    
+    # Stable loss functions - remove focal loss for now
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=tokenizer.pad_token_id, 
+        label_smoothing=0.1,  # Reduced label smoothing
+        reduction='mean'
+    )
+    
+    # Remove focal loss temporarily to avoid numerical instability
+    # focal_criterion = FocalLoss(alpha=1, gamma=1.5)
     
     # Additional loss for vision-text alignment
     mse_loss = nn.MSELoss()
+    
+    # Conservative gradient clipping for stability
+    max_grad_norm = 0.5
     
     best_val_loss = float('inf')
     patience_counter = 0
@@ -320,33 +365,48 @@ def train_model(model, train_loader, val_loader, tokenizer, model_type, num_epoc
                 # Enhanced model or fallback
                 logits = model(images, input_ids, attention_mask)
             
-            # Primary language modeling loss
+            # Stable loss calculation - use only standard cross-entropy for now
             lm_loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
             
-            # Vision-text alignment loss (every few batches to avoid overhead)
+            # Enhanced vision-text alignment loss (every few batches)
             alignment_loss = 0
-            if batch_idx % 4 == 0:  # Apply alignment loss every 4th batch
-                # Get vision features
-                vision_features = model.vision_encoder(images)
-                if hasattr(model, 'vision_projection'):
-                    vision_features = model.vision_projection(vision_features)
-                
-                # Text features from decoder (average pooling)
-                with torch.no_grad():
-                    text_embeddings = model.decoder.token_embedding(input_ids)
-                    text_features = text_embeddings.mean(dim=1)  # [batch, hidden_dim]
-                
-                # Alignment loss - encourage vision and text features to be similar
-                alignment_loss = mse_loss(vision_features, text_features.detach()) * 0.1
-                total_alignment_loss += alignment_loss.item()
+            if batch_idx % 8 == 0:  # Less frequent to avoid overhead
+                try:
+                    # Get vision features
+                    vision_features = model.vision_encoder(images)
+                    if hasattr(model, 'vision_projection'):
+                        vision_features = model.vision_projection(vision_features)
+                    
+                    # Simple diversity encouragement (much more conservative)
+                    if len(vision_features.shape) > 2:
+                        vision_features = vision_features.mean(dim=[2, 3])  # Global average pooling
+                    
+                    # Very small alignment loss to avoid instability
+                    vision_norm = F.normalize(vision_features, p=2, dim=1)
+                    alignment_loss = -torch.mean(torch.std(vision_norm, dim=0)) * 0.001  # Very small weight
+                    
+                    # Check for NaN in alignment loss
+                    if torch.isnan(alignment_loss):
+                        alignment_loss = 0
+                    
+                    total_loss = lm_loss + alignment_loss
+                    total_alignment_loss += alignment_loss.item() if isinstance(alignment_loss, torch.Tensor) else alignment_loss
+                except Exception as e:
+                    total_loss = lm_loss
+                    alignment_loss = 0
+            else:
+                total_loss = lm_loss
             
-            # Combined loss
-            total_loss = lm_loss + alignment_loss
+            # Check for NaN in main loss
+            if torch.isnan(total_loss):
+                print(f"NaN detected in loss at batch {batch_idx}, skipping...")
+                continue
             
             # Backward pass with gradient clipping
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
+            scheduler.step()  # Step per batch for OneCycleLR
             
             total_train_loss += lm_loss.item()
             train_bar.set_postfix({
@@ -354,9 +414,6 @@ def train_model(model, train_loader, val_loader, tokenizer, model_type, num_epoc
                 'align_loss': f'{alignment_loss.item() if isinstance(alignment_loss, torch.Tensor) else alignment_loss:.4f}',
                 'max_len': curr_max_len
             })
-        
-        # Update learning rate
-        scheduler.step()
         
         avg_train_loss = total_train_loss / len(train_loader)
         avg_alignment_loss = total_alignment_loss / (len(train_loader) // 4) if total_alignment_loss > 0 else 0

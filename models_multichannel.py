@@ -79,20 +79,31 @@ class MultiChannelVisionEncoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Spatial attention for focusing on important regions
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 4, hidden_dim // 8, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_dim // 8, 1, 1),
-            nn.Sigmoid()
+        # Enhanced spatial attention with multiple heads for better feature focus
+        self.spatial_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(hidden_dim, hidden_dim // 8, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(hidden_dim // 8, 1, 1),
+                nn.Sigmoid()
+            ) for _ in range(4)  # Multiple attention heads
+        ])
+        
+        # Self-attention for spatial feature refinement
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
         )
         
-        # Multi-scale feature projection
+        # Multi-scale feature projection with residual connections
         self.feature_projection = nn.Sequential(
-            nn.AdaptiveAvgPool2d((2, 2)),  # Keep some spatial info
+            nn.AdaptiveAvgPool2d((4, 4)),  # Keep more spatial info for graffiti details
             nn.Flatten(),
+            nn.Linear(hidden_dim * 16, hidden_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
             nn.Linear(hidden_dim * 4, hidden_dim * 2),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
@@ -139,12 +150,29 @@ class MultiChannelVisionEncoder(nn.Module):
         # Extract hierarchical features
         features = self.feature_extractor(attended_features)
         
-        # Apply spatial attention
-        spatial_weights = self.spatial_attention(features)
-        attended_features = features * spatial_weights
+        # Apply multiple spatial attention heads and combine
+        spatial_attentions = []
+        for attention_head in self.spatial_attention:
+            attention_weights = attention_head(features)
+            attended = features * attention_weights
+            spatial_attentions.append(attended)
+        
+        # Combine multiple attention outputs
+        multi_attended = torch.stack(spatial_attentions, dim=1).mean(dim=1)
+        
+        # Reshape for self-attention (spatial locations as sequence)
+        batch_size, channels, height, width = multi_attended.shape
+        spatial_tokens = multi_attended.view(batch_size, channels, height * width).permute(0, 2, 1)
+        
+        # Apply self-attention across spatial locations
+        attended_spatial, _ = self.self_attention(spatial_tokens, spatial_tokens, spatial_tokens)
+        
+        # Reshape back and add residual connection
+        attended_spatial = attended_spatial.permute(0, 2, 1).view(batch_size, channels, height, width)
+        enhanced_features = multi_attended + attended_spatial
         
         # Project to final representation
-        output = self.feature_projection(attended_features)
+        output = self.feature_projection(enhanced_features)
         
         return output
 
@@ -161,12 +189,33 @@ class LanguageConditionedDecoder(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_length, hidden_dim)
         
-        # Language conditioning embeddings
+        # Enhanced language conditioning embeddings with more capacity
         self.language_embedding = nn.Embedding(num_languages, hidden_dim // 2)
         self.writing_system_embedding = nn.Embedding(num_writing_systems, hidden_dim // 2)
         
-        # Language conditioning projection
-        self.language_projection = nn.Linear(hidden_dim, hidden_dim)
+        # Multi-layer language conditioning with cross-attention
+        self.language_fusion = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
+        # Cross-modal attention between vision and language
+        self.cross_modal_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=8,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Language conditioning projection with residual
+        self.language_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         
         # Vision-text cross-attention
         self.vision_text_attention = nn.MultiheadAttention(
@@ -189,15 +238,22 @@ class LanguageConditionedDecoder(nn.Module):
         # Layer normalization
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
-        # Output projection with multiple stages for better learning
+        # Enhanced output projection with skip connections and better regularization
         self.output_projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.15),
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 4, vocab_size)
+            nn.Linear(hidden_dim // 2, vocab_size)
         )
+        
+        # Additional regularization layers
+        self.feature_dropout = nn.Dropout(0.2)
+        self.gradient_clipping = True
         
         self.dropout = nn.Dropout(0.1)
         
@@ -210,35 +266,47 @@ class LanguageConditionedDecoder(nn.Module):
         token_emb = self.token_embedding(input_ids)
         pos_emb = self.position_embedding(positions)
         
-        # Language conditioning
+        # Language conditioning with enhanced fusion
         if language_ids is not None and writing_system_ids is not None:
             lang_emb = self.language_embedding(language_ids).unsqueeze(1)  # [batch, 1, hidden_dim//2]
             ws_emb = self.writing_system_embedding(writing_system_ids).unsqueeze(1)  # [batch, 1, hidden_dim//2]
             
             # Combine language and writing system embeddings
             lang_condition = torch.cat([lang_emb, ws_emb], dim=-1)  # [batch, 1, hidden_dim]
-            lang_condition = self.language_projection(lang_condition)
             
-            # Broadcast language conditioning to all positions
+            # Enhanced language fusion with residual connection
+            lang_enhanced = self.language_fusion(lang_condition)
+            lang_condition = lang_condition + lang_enhanced
+            
+            # Project and broadcast to all positions
+            lang_condition = self.language_projection(lang_condition)
             lang_condition = lang_condition.expand(-1, seq_len, -1)
         else:
             lang_condition = torch.zeros_like(token_emb)
         
-        # Combine all embeddings
+        # Combine all embeddings with feature dropout
         embeddings = self.dropout(token_emb + pos_emb + lang_condition)
+        embeddings = self.feature_dropout(embeddings)
         
-        # Vision features as memory for cross-attention
-        vision_memory = vision_features.unsqueeze(1)  # [batch, 1, hidden_dim]
+        # Vision features as memory for cross-attention (expand for better context)
+        vision_memory = vision_features.unsqueeze(1).expand(-1, 3, -1)  # [batch, 3, hidden_dim]
         
-        # Cross-attention between text and vision
-        attended_embeddings, _ = self.vision_text_attention(
+        # Enhanced cross-modal attention
+        cross_attended, cross_attention_weights = self.cross_modal_attention(
             query=embeddings,
             key=vision_memory,
             value=vision_memory
         )
         
-        # Combine original embeddings with attended features
-        embeddings = self.layer_norm(embeddings + attended_embeddings)
+        # Vision-text cross-attention
+        vision_attended, _ = self.vision_text_attention(
+            query=embeddings + cross_attended,  # Combine both attention types
+            key=vision_memory,
+            value=vision_memory
+        )
+        
+        # Multi-level attention fusion with residual connections
+        embeddings = self.layer_norm(embeddings + cross_attended + vision_attended)
         
         # Generate causal mask for autoregressive generation
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1)
