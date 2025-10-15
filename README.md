@@ -1,59 +1,19 @@
-# SOPHIA - Epigraphic AI
+# Saint Sophia Graffiti Recognition
 
-Multimodal deep learning framework for reading ancient inscriptions from Saint Sophia Cathedral in Kyiv, Ukraine. This tool combines computer vision with spatial annotation data to automatically transcribe  graffiti and historical texts, advancing digital humanities research through AI-powered archaeological text recognition.
+Multimodal deep learning framework for automatic transcription of ancient inscriptions from Saint Sophia Cathedral in Kyiv, Ukraine. Combines RTI imaging and Korniienko photo/drawing documentation with transformer-based models.
 
-## Overview
+## Features
 
-SOPHIA is inspired by state-of-the-art approaches like [ITHACA](https://github.com/google-deepmind/ithaca), [Predicting the Past](https://github.com/google-deepmind/predictingthepast), and [Ancient Text Restoration](https://github.com/sommerschield/ancient-text-restoration), but specifically designed for the unique challenges of graffiti and spatial annotation integration.
+- **Multi-modal architecture**: RTI images (12 channels) + Korniienko photos/drawings
+- **3 model architectures**: Multi-Channel CNN, Enhanced CNN, Transformer (50-70M params)
+- **Multilingual support**: Greek, Latin, Cyrillic scripts
+- **Unified training pipeline**: Single script for all models and modalities
+- **Comprehensive evaluation**: CER, WER, per-language metrics, error analysis
 
-### Key Innovation
-
-Unlike traditional OCR systems, SOPHIA leverages **spatial annotation metadata** alongside visual features to achieve better recognition accuracy. Each training example combines:
-
-- High-resolution inscription images
-- Geometric annotation data (bounding boxes, polygons, coordinates)
-- Historical context (dating, language, surface information)
-- Transcription ground truth
-
-## Architecture
-
-```text
-Input Modalities:
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│   Images    │    │   Spatial    │    │    Text     │
-│             │    │ Annotations  │    │  Context    │
-└─────────────┘    └──────────────┘    └─────────────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│   Vision    │    │   Spatial    │    │    Text     │
-│  Encoder    │    │   Encoder    │    │  Encoder    │
-└─────────────┘    └──────────────┘    └─────────────┘
-       │                   │                   │
-       └─────────▼─────────┘───────────────────┘
-                 │
-                 ▼
-         ┌─────────────┐
-         │ Multimodal  │
-         │   Fusion    │
-         └─────────────┘
-                 │
-                 ▼
-         ┌─────────────┐
-         │ Transformer │
-         │   Decoder   │
-         └─────────────┘
-                 │
-                 ▼
-         ┌─────────────┐
-         │ Inscription │
-         │Transcription│
-         └─────────────┘
-```
 
 ## Quick Start
 
-### 1. Installation
+### Installation
 
 ```bash
 git clone https://github.com/gu-gridh/sophia-epigraphic-ai.git
@@ -61,123 +21,64 @@ cd sophia-epigraphic-ai
 pip install -r requirements.txt
 ```
 
-### 2. Data Preparation
+### Training
 
-First, collect your data using the Saint Sophia data tools:
+**Phase 1: Korniienko-only** (Available NOW - 939 samples)
+```bash
+python train.py --model enhanced --use_korniienko --no_rti --epochs 5 --batch_size 8
+```
+
+**Phase 2: RTI-only** (After cropping completes)
+```bash
+python train.py --model enhanced --use_rti --no_korniienko --epochs 10 --batch_size 8
+```
+
+**Phase 3: Full multi-modal** (Best performance)
+```bash
+python train.py --model transformer --use_rti --use_korniienko --epochs 20 --batch_size 8
+```
+
+### Evaluation
 
 ```bash
-# In your Saint Sophia backend directory
-cd saintsophia-backend/data_tools
-python export_inscriptions.py
-python download_annotations.py inscriptions_*.csv
-python create_dataset.py inscriptions_*.csv
+python evaluate.py \
+    --model enhanced \
+    --checkpoint checkpoints/enhanced/phase1/best_model.pt \
+    --use_korniienko --no_rti \
+    --output_dir evaluation_results/enhanced_phase1
 ```
 
-Then prepare the data for SOPHIA training:
+**Outputs**: metrics.json, predictions.csv, error_analysis.csv, EVALUATION_REPORT.md
 
-```bash
-# In SOPHIA directory
-python scripts/prepare_dataset.py \
-  --csv_path /path/to/combined_dataset_*.csv \
-  --annotations_dir /path/to/annotations/ \
-  --images_dir /path/to/images/ \
-  --output_dir ./data \
-  --validate
-```
+## Model Architectures
 
-### 3. Training
+| Model | Parameters | Input Modalities |
+|-------|------------|------------------|
+| Multi-Channel CNN | 70.3M | RTI + Korniienko |
+| Enhanced CNN | 58.0M | RTI + Korniienko |
+| Transformer | 50.8M | RTI + Korniienko |
 
-```bash
-python train.py --config configs/sophia_base.json --data_dir ./data
-```
+All models support flexible modality selection via command-line flags.
 
-### 4. Inference
+## Documentation
 
-Single image:
-```bash
-python predict.py \
-  --model_path ./checkpoints/best_model.pt \
-  --config configs/sophia_base.json \
-  --image /path/to/inscription.jpg \
-  --annotation /path/to/annotation.json
-```
+- **TRAINING_GUIDE.md** - Complete training documentation
+- **EVALUATION_GUIDE.md** - Evaluation metrics and analysis
+- **SESSION_SUMMARY.md** - Technical implementation details
 
-Batch processing:
-```bash
-python predict.py \
-  --model_path ./checkpoints/best_model.pt \
-  --config configs/sophia_base.json \
-  --images_dir ./data/images \
-  --output results.json
-```
-
-## Data Integration
-
-SOPHIA seamlessly integrates with the Saint Sophia data collection pipeline:
-
-```bash
-# Complete workflow from database to trained model
-
-# 1. Export from database (Saint Sophia backend)
-cd saintsophia-backend/data_tools
-python collect_data.py  # All-in-one data collection
-
-# 2. Prepare for SOPHIA (this repository)
-cd sophia-epigraphic-ai
-python scripts/prepare_dataset.py \
-  --csv_path ../saintsophia-backend/combined_dataset_*.csv \
-  --annotations_dir ../saintsophia-backend/annotations/ \
-  --images_dir /path/to/your/images/ \
-  --output_dir ./data
-
-# 3. Train SOPHIA model
-python train.py --config configs/sophia_base.json
-
-# 4. Use for inference
-python predict.py --model_path ./checkpoints/best_model.pt --config configs/sophia_base.json --image new_inscription.jpg
-```
-
-## Model Features
-
-### Vision Component
-- **Multi-scale feature extraction** using pre-trained CNN backbones
-- **Spatial pyramid pooling** for handling variable inscription sizes
-- **Attention mechanisms** for focusing on text regions
-
-### Spatial Component
-- **Geometric encoding** of annotation coordinates
-- **Spatial relationship modeling** between multiple annotations
-- **Layout-aware feature fusion**
-
-### Text Component
-- **Multilingual support** (Greek, Latin, Cyrillic scripts)
-- **Historical language modeling** with specialized embeddings
-- **Character-level processing** for damaged text handling
-
-### Training Innovations
-- **Annotation-guided learning**: Each annotation becomes a training example
-- **Multi-task objectives**: Transcription + dating + restoration confidence
-- **Data augmentation** for limited historical datasets
-
-## Dataset Structure
-
-After preparation, your dataset will have this structure:
+## Project Structure
 
 ```
-data/
-├── train_dataset.csv          # Training split
-├── val_dataset.csv            # Validation split  
-├── test_dataset.csv           # Test split
-├── images/                    # All inscription images
-│   ├── 123.jpg
-│   └── 456.jpg
-├── annotations/               # All annotation JSON files
-│   ├── annotation_123.json
-│   └── annotation_456.json
-└── dataset_stats.json         # Dataset statistics
+sophia-epigraphic-ai/
+├── train.py                    # Unified training script
+├── evaluate.py                 # Comprehensive evaluation
+├── data/                       # Train/val/test CSV files
+├── models/                     # Model architectures
+│   ├── models_multichannel.py  # Multi-Channel CNN
+│   ├── models_enhanced.py      # Enhanced CNN
+│   └── models_transformer.py   # Transformer
+├── checkpoints/                # Saved model checkpoints
+├── evaluation_results/         # Evaluation outputs
+└── cropped_images_hq/          # RTI images (4 types)
 ```
 
-Each CSV row contains:
-- **All inscription fields** (23 fields: transcription, metadata, translations, etc.)
-- **Annotation metadata** (index, coordinates, geometry type)
-- **File paths** for images and annotations
