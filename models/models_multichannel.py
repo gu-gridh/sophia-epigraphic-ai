@@ -17,10 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class MultiChannelVisionEncoder(nn.Module):
-    """Enhanced 12-channel vision encoder with attention and multi-scale features."""
+    """
+    Enhanced 12-channel vision encoder with attention and multi-scale features.
+    Supports optional Korniienko reference images (photo + drawing).
+    """
     
-    def __init__(self, input_channels=12, hidden_dim=512):
+    def __init__(self, input_channels=12, hidden_dim=512, use_korniienko=True):
         super().__init__()
+        self.use_korniienko = use_korniienko
         
         # Channel-specific processors for different image types
         # Each processes 3 RGB channels from one image type
@@ -110,10 +114,66 @@ class MultiChannelVisionEncoder(nn.Module):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
         
+        # Korniienko image encoders (if enabled)
+        if self.use_korniienko:
+            # Korniienko photo encoder (3 RGB channels)
+            self.korniienko_photo_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(64, 128, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 256, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(256, hidden_dim),
+                nn.ReLU(inplace=True)
+            )
+            
+            # Korniienko drawing encoder (3 channels or 1 grayscale)
+            self.korniienko_drawing_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(64, 128, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 256, 3, 2, 1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(256, hidden_dim),
+                nn.ReLU(inplace=True)
+            )
+            
+            # Fusion layer for combining RTI + Korniienko features
+            self.multimodal_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 3, hidden_dim * 2),  # RTI + photo + drawing
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(hidden_dim * 2, hidden_dim)
+            )
+        
         self.output_dim = hidden_dim
     
-    def forward(self, x):
-        """Forward pass through enhanced multi-channel vision encoder."""
+    def forward(self, x, korniienko_photo=None, korniienko_drawing=None):
+        """
+        Forward pass through enhanced multi-channel vision encoder.
+        
+        Args:
+            x: [batch, 12, H, W] - RTI images (4 types × 3 RGB)
+            korniienko_photo: [batch, 3, H, W] - Optional Korniienko photograph
+            korniienko_drawing: [batch, 3, H, W] - Optional Korniienko drawing
+            
+        Returns:
+            output: [batch, hidden_dim] - Fused visual features
+        """
         batch_size = x.size(0)
         
         # Process each image type separately (original, blended, normal, texture)
@@ -173,6 +233,30 @@ class MultiChannelVisionEncoder(nn.Module):
         
         # Project to final representation
         output = self.feature_projection(enhanced_features)
+        
+        # Integrate Korniienko features if available
+        if self.use_korniienko and (korniienko_photo is not None or korniienko_drawing is not None):
+            features_list = [output]
+            
+            # Encode Korniienko photo
+            if korniienko_photo is not None:
+                photo_features = self.korniienko_photo_encoder(korniienko_photo)
+                features_list.append(photo_features)
+            else:
+                # Use zeros if photo not available
+                features_list.append(torch.zeros_like(output))
+            
+            # Encode Korniienko drawing
+            if korniienko_drawing is not None:
+                drawing_features = self.korniienko_drawing_encoder(korniienko_drawing)
+                features_list.append(drawing_features)
+            else:
+                # Use zeros if drawing not available
+                features_list.append(torch.zeros_like(output))
+            
+            # Fuse all modalities
+            combined_features = torch.cat(features_list, dim=-1)  # [batch, hidden_dim * 3]
+            output = self.multimodal_fusion(combined_features)
         
         return output
 
@@ -325,14 +409,19 @@ class LanguageConditionedDecoder(nn.Module):
         return logits
 
 class MultiChannelModel(nn.Module):
-    """Enhanced multi-channel graffiti recognition model with language conditioning."""
+    """Enhanced multi-channel graffiti recognition model with language conditioning and Korniienko support."""
     
     def __init__(self, vocab_size, vision_dim=512, hidden_dim=512, num_layers=8, 
-                 num_languages=10, num_writing_systems=5):
+                 num_languages=10, num_writing_systems=5, use_korniienko=True):
         super().__init__()
         
-        # Enhanced vision encoder
-        self.vision_encoder = MultiChannelVisionEncoder(input_channels=12, hidden_dim=vision_dim)
+        # Enhanced vision encoder with Korniienko support
+        self.vision_encoder = MultiChannelVisionEncoder(
+            input_channels=12, 
+            hidden_dim=vision_dim,
+            use_korniienko=use_korniienko
+        )
+        self.use_korniienko = use_korniienko
         
         # Vision projection
         self.vision_projection = nn.Sequential(
@@ -383,11 +472,30 @@ class MultiChannelModel(nn.Module):
         
         return language_ids, writing_system_ids
         
-    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None):
-        """Forward pass with optional language conditioning."""
+    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None,
+                korniienko_photo=None, korniienko_drawing=None):
+        """
+        Forward pass with optional language conditioning and Korniienko images.
         
-        # Vision encoding with multi-channel processing
-        vision_features = self.vision_encoder(images)
+        Args:
+            images: [batch, 12, H, W] - RTI images (4 types × 3 RGB)
+            input_ids: [batch, seq_len] - Token IDs for decoding
+            attention_mask: [batch, seq_len] - Attention mask
+            languages: List of language strings
+            writing_systems: List of writing system strings
+            korniienko_photo: [batch, 3, H, W] - Optional Korniienko photograph
+            korniienko_drawing: [batch, 3, H, W] - Optional Korniienko drawing
+            
+        Returns:
+            logits: [batch, seq_len, vocab_size] - Output logits
+        """
+        
+        # Vision encoding with multi-channel processing + Korniienko
+        vision_features = self.vision_encoder(
+            images, 
+            korniienko_photo=korniienko_photo,
+            korniienko_drawing=korniienko_drawing
+        )
         vision_features = self.vision_projection(vision_features)
         
         # Encode language information if provided
@@ -408,8 +516,25 @@ class MultiChannelModel(nn.Module):
         return logits
     
     def generate(self, images, languages=None, writing_systems=None, max_length=50, 
-                 bos_token_id=1, eos_token_id=2, temperature=1.0):
-        """Generate text from images with optional language conditioning."""
+                 bos_token_id=1, eos_token_id=2, temperature=1.0,
+                 korniienko_photo=None, korniienko_drawing=None):
+        """
+        Generate text from images with optional language conditioning and Korniienko images.
+        
+        Args:
+            images: [batch, 12, H, W] - RTI images
+            languages: List of language strings
+            writing_systems: List of writing system strings
+            max_length: Maximum generation length
+            bos_token_id: Beginning of sequence token ID
+            eos_token_id: End of sequence token ID
+            temperature: Sampling temperature
+            korniienko_photo: [batch, 3, H, W] - Optional Korniienko photograph
+            korniienko_drawing: [batch, 3, H, W] - Optional Korniienko drawing
+            
+        Returns:
+            generated: [batch, seq_len] - Generated token IDs
+        """
         
         self.eval()
         device = images.device
@@ -417,7 +542,11 @@ class MultiChannelModel(nn.Module):
         
         # Vision encoding
         with torch.no_grad():
-            vision_features = self.vision_encoder(images)
+            vision_features = self.vision_encoder(
+                images,
+                korniienko_photo=korniienko_photo,
+                korniienko_drawing=korniienko_drawing
+            )
             vision_features = self.vision_projection(vision_features)
             
             # Encode language information
@@ -462,16 +591,23 @@ class MultiChannelModel(nn.Module):
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
             'vision_encoder': 'Enhanced 12-channel CNN with attention',
-            'decoder': 'Language-conditioned 6-layer Transformer',
+            'decoder': 'Language-conditioned 8-layer Transformer',
             'language_conditioning': 'Language + Writing System embeddings',
+            'korniienko_support': self.use_korniienko,
             'supported_languages': list(self.language_map.keys()),
             'supported_writing_systems': list(self.writing_system_map.keys()),
             'features': [
-                'Multi-channel image processing',
+                'Multi-channel RTI image processing',
+                'Korniienko reference images (photo + drawing)' if self.use_korniienko else None,
                 'Channel-specific attention',
                 'Spatial attention mechanism',
                 'Language conditioning',
                 'Cross-modal attention',
-                'Multi-scale feature extraction'
+                'Multi-scale feature extraction',
+                'Multi-modal fusion'
             ]
         }
+        
+        # Remove None values from features
+        return {k: [f for f in v if f is not None] if isinstance(v, list) else v 
+                for k, v in info.items()}

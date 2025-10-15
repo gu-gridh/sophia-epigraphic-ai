@@ -19,8 +19,9 @@ import torch.nn.functional as F
 class EnhancedVisionEncoder(nn.Module):
     """Enhanced vision encoder with channel attention and deep feature extraction."""
     
-    def __init__(self, input_channels=12, hidden_dim=512):
+    def __init__(self, input_channels=12, hidden_dim=512, use_korniienko=True):
         super().__init__()
+        self.use_korniienko = use_korniienko
         
         # Channel attention for different image types (original, blended, normal, texture)
         self.channel_attention = nn.Sequential(
@@ -95,6 +96,53 @@ class EnhancedVisionEncoder(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
+        # Korniienko image encoders (optional for multi-modal fusion)
+        if self.use_korniienko:
+            # Encoder for Korniienko photo (3 RGB channels)
+            self.korniienko_photo_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(256, hidden_dim),
+                nn.LayerNorm(hidden_dim)
+            )
+            
+            # Encoder for Korniienko drawing (3 RGB channels)
+            self.korniienko_drawing_encoder = nn.Sequential(
+                nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(256, hidden_dim),
+                nn.LayerNorm(hidden_dim)
+            )
+            
+            # Fusion layer for combining RTI + photo + drawing features
+            self.multimodal_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 3, hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.LayerNorm(hidden_dim)
+            )
+        
         self.output_dim = hidden_dim
     
     def _make_layer(self, inplanes, planes, blocks, stride=1):
@@ -105,7 +153,18 @@ class EnhancedVisionEncoder(nn.Module):
             layers.append(ResidualBlock(planes, planes))
         return nn.Sequential(*layers)
     
-    def forward(self, x):
+    def forward(self, x, korniienko_photo=None, korniienko_drawing=None):
+        """
+        Forward pass with optional multi-modal fusion.
+        
+        Args:
+            x: RTI images [batch_size, 12, height, width]
+            korniienko_photo: Optional Korniienko photo [batch_size, 3, height, width]
+            korniienko_drawing: Optional Korniienko drawing [batch_size, 3, height, width]
+            
+        Returns:
+            features: Fused visual features [batch_size, hidden_dim]
+        """
         # Apply channel attention to emphasize important image types
         channel_weights = self.channel_attention(x)
         x = x * channel_weights
@@ -123,8 +182,29 @@ class EnhancedVisionEncoder(nn.Module):
         attention = self.spatial_attention(x4)
         x4_attended = x4 * attention
         
-        # Global feature extraction
-        features = self.feature_projection(x4_attended)
+        # Global feature extraction from RTI
+        rti_features = self.feature_projection(x4_attended)
+        
+        # Multi-modal fusion if Korniienko images are available
+        if self.use_korniienko and (korniienko_photo is not None or korniienko_drawing is not None):
+            # Encode Korniienko photo (or use zeros if not available)
+            if korniienko_photo is not None:
+                photo_features = self.korniienko_photo_encoder(korniienko_photo)
+            else:
+                photo_features = torch.zeros_like(rti_features)
+            
+            # Encode Korniienko drawing (or use zeros if not available)
+            if korniienko_drawing is not None:
+                drawing_features = self.korniienko_drawing_encoder(korniienko_drawing)
+            else:
+                drawing_features = torch.zeros_like(rti_features)
+            
+            # Fuse all modalities: RTI + photo + drawing
+            combined = torch.cat([rti_features, photo_features, drawing_features], dim=-1)
+            features = self.multimodal_fusion(combined)
+        else:
+            features = rti_features
+        
         return features
 
 class ResidualBlock(nn.Module):
@@ -299,10 +379,15 @@ class EnhancedModel(nn.Module):
     """Enhanced graffiti recognition model with deep learning and language conditioning."""
     
     def __init__(self, vocab_size, vision_dim=512, hidden_dim=512, num_layers=8, 
-                 num_languages=10, num_writing_systems=5):
+                 num_languages=10, num_writing_systems=5, use_korniienko=True):
         super().__init__()
         self.vocab_size = vocab_size
-        self.vision_encoder = EnhancedVisionEncoder(input_channels=12, hidden_dim=vision_dim)
+        self.use_korniienko = use_korniienko
+        self.vision_encoder = EnhancedVisionEncoder(
+            input_channels=12, 
+            hidden_dim=vision_dim,
+            use_korniienko=use_korniienko
+        )
         
         # Enhanced vision projection with residual connection and layer norm
         self.vision_projection = nn.Sequential(
@@ -337,10 +422,29 @@ class EnhancedModel(nn.Module):
         self.model_type = "enhanced_v2"
         self.description = f"Deep vision + 8-layer transformer + language conditioning (vocab:{vocab_size})"
         
-    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None):
-        """Enhanced forward pass with language conditioning."""
-        # Deep vision encoding with attention
-        vision_features = self.vision_encoder(images)
+    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None,
+                korniienko_photo=None, korniienko_drawing=None):
+        """
+        Enhanced forward pass with language conditioning and multi-modal fusion.
+        
+        Args:
+            images: RTI images [batch_size, 12, height, width]
+            input_ids: Token IDs [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
+            languages: Language IDs [batch_size]
+            writing_systems: Writing system IDs [batch_size]
+            korniienko_photo: Optional Korniienko photo [batch_size, 3, height, width]
+            korniienko_drawing: Optional Korniienko drawing [batch_size, 3, height, width]
+            
+        Returns:
+            logits: Character predictions [batch_size, seq_length, vocab_size]
+        """
+        # Deep vision encoding with attention and multi-modal fusion
+        vision_features = self.vision_encoder(
+            images, 
+            korniienko_photo=korniienko_photo,
+            korniienko_drawing=korniienko_drawing
+        )
         vision_features = self.vision_projection(vision_features)
         
         # Language-conditioned text generation
@@ -361,6 +465,14 @@ class EnhancedModel(nn.Module):
         vision_params = sum(p.numel() for p in self.vision_encoder.parameters())
         decoder_params = sum(p.numel() for p in self.decoder.parameters())
         
+        features = [
+            'Deep ResNet + Channel/Spatial Attention',
+            'Korniienko reference images (photo + drawing)' if self.use_korniienko else None,
+            '8-layer Transformer + Language Conditioning + Cross-Modal Attention',
+            'Channel Attention + Spatial Attention + Cross-Modal Attention',
+            'Dropout + LayerNorm + Residual Connections'
+        ]
+        
         return {
             'type': self.model_type,
             'description': self.description,
@@ -368,9 +480,11 @@ class EnhancedModel(nn.Module):
             'trainable_parameters': trainable_params,
             'vision_encoder_params': vision_params,
             'decoder_params': decoder_params,
+            'korniienko_support': self.use_korniienko,
             'vision_encoder': 'Deep ResNet + Channel/Spatial Attention',
             'decoder': '8-layer Transformer + Language Conditioning + Cross-Modal Attention',
             'language_conditioning': 'Language + Writing System Embeddings with Cross-Modal Fusion',
+            'features': [f for f in features if f is not None],
             'attention_mechanisms': 'Channel Attention + Spatial Attention + Cross-Modal Attention',
             'regularization': 'Dropout + LayerNorm + Residual Connections'
         }
