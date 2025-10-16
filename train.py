@@ -117,7 +117,7 @@ class SophiaMultiModalDataset(Dataset):
     
     def __init__(self, csv_file, data_dir, tokenizer, max_length=128,
                  use_rti=True, use_korniienko=True, model_type='enhanced',
-                 image_size=224, augment=False):
+                 image_size=224, augment=False, split='train'):
         """
         Args:
             csv_file: Path to comprehensive dataset CSV
@@ -129,6 +129,7 @@ class SophiaMultiModalDataset(Dataset):
             model_type: 'multichannel', 'enhanced', or 'transformer'
             image_size: Target image size
             augment: Whether to apply data augmentation
+            split: Dataset split ('train', 'val', or 'test')
         """
         self.df = pd.read_csv(csv_file)
         self.data_dir = Path(data_dir)
@@ -138,6 +139,7 @@ class SophiaMultiModalDataset(Dataset):
         self.use_korniienko = use_korniienko
         self.model_type = model_type
         self.image_size = image_size
+        self.split = split
         
         # Define transforms
         self.transform = self._create_transforms(augment)
@@ -172,12 +174,12 @@ class SophiaMultiModalDataset(Dataset):
     def _create_mappings(self):
         """Create language and writing system mappings."""
         # Language mapping
-        languages = self.df['language'].fillna('unknown').unique()
+        languages = self.df['language_name'].fillna('unknown').unique()
         self.language_to_idx = {lang: idx for idx, lang in enumerate(sorted(languages))}
         self.idx_to_language = {idx: lang for lang, idx in self.language_to_idx.items()}
         
         # Writing system mapping
-        writing_systems = self.df['writing_system'].fillna('unknown').unique()
+        writing_systems = self.df['writing_system_name'].fillna('unknown').unique()
         self.ws_to_idx = {ws: idx for idx, ws in enumerate(sorted(writing_systems))}
         self.idx_to_ws = {idx: ws for ws, idx in self.ws_to_idx.items()}
         
@@ -190,7 +192,7 @@ class SophiaMultiModalDataset(Dataset):
         
         for idx, row in self.df.iterrows():
             # Check transcription
-            if pd.isna(row.get('clean_transcription')) or len(str(row.get('clean_transcription'))) < 2:
+            if pd.isna(row.get('transcription_clean')) or len(str(row.get('transcription_clean'))) < 2:
                 continue
             
             # Check RTI images if required
@@ -211,10 +213,10 @@ class SophiaMultiModalDataset(Dataset):
         if pd.isna(isialy_id):
             return False
         
-        # Check for at least one RTI type
-        rti_dir = self.data_dir / 'cropped_images_hq' / 'train'
+        # Check for at least one RTI type in the correct split directory
+        rti_dir = self.data_dir / 'data' / 'cropped_images_hq' / self.split
         for img_type in ['original', 'blended', 'normal', 'texture']:
-            img_path = rti_dir / img_type / f"{isialy_id}.png"
+            img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
             if img_path.exists():
                 return True
         return False
@@ -239,7 +241,7 @@ class SophiaMultiModalDataset(Dataset):
         isialy_id = row.get('isialy_id', row.get('id', ''))
         
         # Load transcription
-        transcription = str(row.get('clean_transcription', ''))
+        transcription = str(row.get('transcription_clean', ''))
         
         # Tokenize
         encoded = self.tokenizer(
@@ -269,8 +271,8 @@ class SophiaMultiModalDataset(Dataset):
             item['korniienko_drawing'] = drawing
         
         # Load metadata
-        language = row.get('language', 'unknown')
-        writing_system = row.get('writing_system', 'unknown')
+        language = row.get('language_name', 'unknown')
+        writing_system = row.get('writing_system_name', 'unknown')
         
         item['language'] = self.language_to_idx.get(language, 0)
         item['writing_system'] = self.ws_to_idx.get(writing_system, 0)
@@ -279,12 +281,12 @@ class SophiaMultiModalDataset(Dataset):
     
     def _load_rti_images(self, isialy_id):
         """Load and stack RTI images (4 types × 3 RGB = 12 channels)."""
-        rti_dir = self.data_dir / 'cropped_images_hq' / 'train'
+        rti_dir = self.data_dir / 'data' / 'cropped_images_hq' / self.split
         rti_types = ['original', 'blended', 'normal', 'texture']
         
         channels = []
         for img_type in rti_types:
-            img_path = rti_dir / img_type / f"{isialy_id}.png"
+            img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
             
             if img_path.exists():
                 img = Image.open(img_path).convert('RGB')
@@ -638,27 +640,27 @@ Examples:
     print("=" * 70)
     print("SAINT SOPHIA GRAFFITI RECOGNITION - UNIFIED TRAINING")
     print("=" * 70)
-    print(f"\n📦 Model: {args.model.upper()}")
-    print(f"🖼️  Modalities:")
+    print(f"\n Model: {args.model.upper()}")
+    print(f"  Modalities:")
     print(f"   RTI Images: {'✓' if args.use_rti else '✗'}")
     print(f"   Korniienko: {'✓' if args.use_korniienko else '✗'}")
-    print(f"\n⚙️  Hyperparameters:")
+    print(f"\n  Hyperparameters:")
     print(f"   Epochs: {args.epochs}")
     print(f"   Batch Size: {args.batch_size}")
     print(f"   Learning Rate: {args.lr}")
     print(f"   Image Size: {args.image_size}×{args.image_size}")
     print(f"   Max Text Length: {args.max_length}")
-    print(f"\n💾 Data:")
+    print(f"\n Data:")
     print(f"   Base Dir: {args.data_dir}")
     print(f"   Train CSV: {args.train_csv}")
     print(f"   Val CSV: {args.val_csv}")
-    print(f"\n🔧 Device: {args.device}")
+    print(f"\n Device: {args.device}")
     print("=" * 70)
     
     # Create checkpoint directory
     checkpoint_dir = Path(args.checkpoint_dir) / args.model / datetime.now().strftime('%Y%m%d_%H%M%S')
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n📁 Checkpoints: {checkpoint_dir}")
+    print(f"\n Checkpoints: {checkpoint_dir}")
     
     # Save configuration
     config_path = checkpoint_dir / 'config.json'
@@ -667,14 +669,14 @@ Examples:
     print(f"✓ Config saved: {config_path}")
     
     # Initialize tokenizer
-    print("\n🔤 Initializing tokenizer...")
+    print("\n Initializing tokenizer...")
     if XLMRobertaTokenizer is not None:
         try:
             tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
             vocab_size = tokenizer.vocab_size
             print(f"✓ XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
         except:
-            print("⚠️  XLM-RoBERTa failed, using character tokenizer")
+            print(" XLM-RoBERTa failed, using character tokenizer")
             tokenizer = CharacterTokenizer()
             vocab_size = tokenizer.vocab_size
     else:
@@ -683,7 +685,7 @@ Examples:
         print(f"✓ Character tokenizer initialized (vocab size: {vocab_size})")
     
     # Create datasets
-    print("\n📊 Loading datasets...")
+    print("\n Loading datasets...")
     train_dataset = SophiaMultiModalDataset(
         csv_file=Path(args.data_dir) / args.train_csv,
         data_dir=args.data_dir,
@@ -693,7 +695,8 @@ Examples:
         use_korniienko=args.use_korniienko,
         model_type=args.model,
         image_size=args.image_size,
-        augment=True
+        augment=True,
+        split='train'
     )
     
     val_dataset = SophiaMultiModalDataset(
@@ -705,7 +708,8 @@ Examples:
         use_korniienko=args.use_korniienko,
         model_type=args.model,
         image_size=args.image_size,
-        augment=False
+        augment=False,
+        split='val'
     )
     
     print(f"\n✓ Training samples: {len(train_dataset)}")
@@ -732,7 +736,7 @@ Examples:
     )
     
     # Create model
-    print("\n🏗️  Creating model...")
+    print("\n  Creating model...")
     model = create_model(
         model_type=args.model,
         vocab_size=vocab_size,
@@ -773,7 +777,7 @@ Examples:
     best_val_loss = float('inf')
     
     if args.resume:
-        print(f"\n📂 Resuming from: {args.resume}")
+        print(f"\n Resuming from: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=args.device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -787,7 +791,7 @@ Examples:
     print("=" * 70)
     
     for epoch in range(start_epoch, args.epochs):
-        print(f"\n📅 Epoch {epoch + 1}/{args.epochs}")
+        print(f"\n Epoch {epoch + 1}/{args.epochs}")
         print("-" * 70)
         
         # Train
@@ -806,7 +810,7 @@ Examples:
         scheduler.step()
         
         # Print metrics
-        print(f"\n📊 Epoch {epoch + 1} Results:")
+        print(f"\n Epoch {epoch + 1} Results:")
         print(f"   Train Loss: {train_loss:.4f}")
         print(f"   Val Loss:   {val_loss:.4f}")
         print(f"   LR:         {scheduler.get_last_lr()[0]:.6f}")
@@ -825,7 +829,7 @@ Examples:
                 'config': vars(args)
             }, checkpoint_path)
             
-            print(f"💾 Checkpoint saved: {checkpoint_path}")
+            print(f" Checkpoint saved: {checkpoint_path}")
             
             # Save best model
             if val_loss < best_val_loss:
@@ -837,13 +841,13 @@ Examples:
                     'val_loss': val_loss,
                     'config': vars(args)
                 }, best_model_path)
-                print(f"🏆 Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
+                print(f" Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
     
     print("\n" + "=" * 70)
-    print("✅ TRAINING COMPLETE")
+    print(" TRAINING COMPLETE")
     print("=" * 70)
-    print(f"\n🏆 Best Validation Loss: {best_val_loss:.4f}")
-    print(f"📁 Checkpoints saved in: {checkpoint_dir}")
+    print(f"\n Best Validation Loss: {best_val_loss:.4f}")
+    print(f" Checkpoints saved in: {checkpoint_dir}")
     
     # Save final model
     final_model_path = checkpoint_dir / 'final_model.pt'
@@ -852,9 +856,9 @@ Examples:
         'model_state_dict': model.state_dict(),
         'config': vars(args)
     }, final_model_path)
-    print(f"💾 Final model saved: {final_model_path}")
+    print(f" Final model saved: {final_model_path}")
     
-    print("\n✅ Done!")
+    print("\n Done!")
 
 
 if __name__ == '__main__':
