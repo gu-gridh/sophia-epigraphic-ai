@@ -1,203 +1,69 @@
-#!/usr/bin/env python3#!/usr/bin/env python3
+#!/usr/bin/env python3
 
-""""""
-
-Unified Training Script for Saint Sophia Graffiti RecognitionTraining script for SOPHIA model.
-
-============================================================="""
-
-
-
-Supports three model architectures with multi-modal inputs:import os
-
-1. Multi-Channel CNN (70M params) - 12-channel RTI + Korniienkoimport sys
-
-2. Enhanced CNN (58M params) - Deep ResNet + Attention + Korniienko  import argparse
-
-3. Transformer (51M params) - Native multi-modal with task headsimport json
-
+import sys
+import argparse
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torchvision.transforms as transforms
+from tqdm import tqdm
+import json
+from datetime import datetime
 from pathlib import Path
+import warnings
+import os
 
-Features:
+warnings.filterwarnings('ignore')
 
-- Multi-modal training (RTI + Korniienko photo + drawing)# Add project root to path
+# Import model architectures
+from models.models_multichannel import MultiChannelModel
+from models.models_enhanced import EnhancedModel
+from models.models_transformer import SophiaTransformerModel
 
-- Language and writing system conditioningproject_root = Path(__file__).parent.parent
+# For tokenization
+try:
+    from transformers import XLMRobertaTokenizer
+except ImportError:
+    print("⚠️  XLM-RoBERTa tokenizer not available. Using basic character tokenizer.")
+    XLMRobertaTokenizer = None
 
-- Flexible data requirements (any subset of modalities)sys.path.append(str(project_root))
+# Increase PIL image size limit
+Image.MAX_IMAGE_PIXELS = None
 
-- Phase-based training support
 
-- Automatic model selection and configurationfrom sophia.training import SophiaTrainer
-
-from sophia.data import create_dataloaders
-
-Usage:
-
-    # Multi-Channel model
-
-    python train.py --model multichannel --epochs 15 --batch_size 6def main():
-
-        parser = argparse.ArgumentParser(description='Train SOPHIA model')
-
-    # Enhanced model    parser.add_argument('--config', required=True, help='Path to configuration file')
-
-    python train.py --model enhanced --epochs 12 --batch_size 8    parser.add_argument('--data_dir', default='./data', help='Data directory')
-
-        parser.add_argument('--resume', help='Path to checkpoint to resume from')
-
-    # Transformer model    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-
-    python train.py --model transformer --epochs 20 --batch_size 4    
-
-        args = parser.parse_args()
-
-    # Korniienko-only training (Phase 1)    
-
-    python train.py --model enhanced --use_korniienko --no_rti --epochs 10    # Load configuration
-
-        with open(args.config, 'r') as f:
-
-    # RTI-only training (Phase 2)        config = json.load(f)
-
-    python train.py --model enhanced --use_rti --no_korniienko --epochs 10    
-
-        # Override data paths if provided
-
-    # Full multi-modal training (Phase 3)    if args.data_dir:
-
-    python train.py --model enhanced --use_korniienko --use_rti --epochs 15        config['data']['train_csv'] = os.path.join(args.data_dir, 'train_dataset.csv')
-
-"""        config['data']['val_csv'] = os.path.join(args.data_dir, 'val_dataset.csv')
-
-        config['data']['images_dir'] = os.path.join(args.data_dir, 'images')
-
-import os        config['data']['annotations_dir'] = os.path.join(args.data_dir, 'annotations')
-
-import sys    
-
-import argparse    # Debug mode
-
-import pandas as pd    if args.debug:
-
-import numpy as np        config['training']['num_epochs'] = 2
-
-import torch        config['training']['batch_size'] = 2
-
-import torch.nn as nn        config['use_wandb'] = False
-
-import torch.optim as optim        print("DEBUG MODE: Reduced epochs and batch size")
-
-from torch.utils.data import Dataset, DataLoader    
-
-from PIL import Image    print("Configuration:")
-
-import torchvision.transforms as transforms    print(json.dumps(config, indent=2))
-
-from tqdm import tqdm    
-
-import json    # Check data availability
-
-from datetime import datetime    train_csv = config['data']['train_csv']
-
-from pathlib import Path    val_csv = config['data']['val_csv']
-
-import warnings    images_dir = config['data']['images_dir']
-
-warnings.filterwarnings('ignore')    annotations_dir = config['data']['annotations_dir']
-
+class CharacterTokenizer:
+    """Simple character-level tokenizer as fallback."""
     
-
-# Import model architectures    if not all(os.path.exists(p) for p in [train_csv, val_csv, images_dir, annotations_dir]):
-
-from models.models_multichannel import MultiChannelModel        print("ERROR: Some data files are missing!")
-
-from models.models_enhanced import EnhancedModel        print(f"Train CSV: {train_csv} - {'✓' if os.path.exists(train_csv) else '✗'}")
-
-from models.models_transformer import SophiaTransformerModel        print(f"Val CSV: {val_csv} - {'✓' if os.path.exists(val_csv) else '✗'}")
-
-        print(f"Images dir: {images_dir} - {'✓' if os.path.exists(images_dir) else '✗'}")
-
-# For tokenization        print(f"Annotations dir: {annotations_dir} - {'✓' if os.path.exists(annotations_dir) else '✗'}")
-
-try:        return 1
-
-    from transformers import XLMRobertaTokenizer    
-
-except ImportError:    # Create data loaders
-
-    print("⚠️  XLM-RoBERTa tokenizer not available. Using basic character tokenizer.")    print("Creating data loaders...")
-
-    XLMRobertaTokenizer = None    train_loader, val_loader = create_dataloaders(
-
-        train_csv=train_csv,
-
-# Increase PIL image size limit        val_csv=val_csv,
-
-Image.MAX_IMAGE_PIXELS = None        images_dir=images_dir,
-
-        annotations_dir=annotations_dir,
-
-        batch_size=config['training']['batch_size'],
-
-class CharacterTokenizer:        num_workers=config['training']['num_workers']
-
-    """Simple character-level tokenizer as fallback."""    )
-
+    def __init__(self, vocab_file=None):
+        # Create character vocabulary
+        self.char_to_idx = {
+            '<PAD>': 0, '<SOS>': 1, '<EOS>': 2, '<UNK>': 3,
+        }
         
+        # Add common characters (Greek, Latin, Cyrillic, numbers, punctuation)
+        chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        chars += "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω"
+        chars += "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+        chars += "0123456789.,;:!?-–—'\"()[]{}/@#$%&*+=<>|\\~`"
+        chars += " \n\t"
+        
+        for idx, char in enumerate(chars, start=4):
+            self.char_to_idx[char] = idx
+        
+        self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
+        self.vocab_size = len(self.char_to_idx)
 
-    def __init__(self, vocab_file=None):    print(f"Train loader: {len(train_loader)} batches")
-
-        # Create character vocabulary    print(f"Validation loader: {len(val_loader)} batches")
-
-        self.char_to_idx = {    
-
-            '<PAD>': 0, '<SOS>': 1, '<EOS>': 2, '<UNK>': 3,    # Create trainer
-
-        }    print("Initializing trainer...")
-
-            trainer = SophiaTrainer(config)
-
-        # Add common characters (Greek, Latin, Cyrillic, numbers, punctuation)    
-
-        chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"    # Resume from checkpoint if provided
-
-        chars += "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω"    if args.resume:
-
-        chars += "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"        print(f"Resuming from checkpoint: {args.resume}")
-
-        chars += "0123456789.,;:!?-–—'\"()[]{}/@#$%&*+=<>|\\~`"        trainer.load_checkpoint(args.resume)
-
-        chars += " \n\t"    
-
-            # Start training
-
-        for idx, char in enumerate(chars, start=4):    print("Starting training...")
-
-            self.char_to_idx[char] = idx    trainer.train(
-
-                train_loader=train_loader,
-
-        self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}        val_loader=val_loader,
-
-        self.vocab_size = len(self.char_to_idx)        num_epochs=config['training']['num_epochs']
-
-            )
-
-    def __call__(self, text, max_length=128, padding='max_length', truncation=True):    
-
-        """Tokenize text into character indices."""    print("Training completed!")
-
-        if isinstance(text, list):    return 0
-
+    def __call__(self, text, max_length=128, padding='max_length', truncation=True):
+        """Tokenize text into character indices."""
+        if isinstance(text, list):
             return {'input_ids': [self._encode_single(t, max_length, padding=='max_length', truncation) for t in text],
-
                     'attention_mask': [self._create_mask(t, max_length) for t in text]}
-
-        else:if __name__ == "__main__":
-
-            return {'input_ids': self._encode_single(text, max_length, padding=='max_length', truncation),    sys.exit(main())
-
+        else:
+            return {'input_ids': self._encode_single(text, max_length, padding=='max_length', truncation),
                     'attention_mask': self._create_mask(text, max_length)}
     
     def _encode_single(self, text, max_length, padding, truncation):
