@@ -316,17 +316,22 @@ class TextEncoder(nn.Module):
         x = x.transpose(0, 1)  # [batch, seq_len, embed_dim]
         
         # Create attention mask for padding
+        # text_mask is 1 for valid tokens, 0 for padding
+        # PyTorch transformer needs True for positions to mask (padding)
         if text_mask is None:
-            text_mask = (text_indices == 0)  # Padding positions
+            padding_mask = (text_indices == 0)  # Padding positions
+        else:
+            # Convert attention_mask (1=valid, 0=padding) to padding_mask (True=padding, False=valid)
+            padding_mask = (text_mask == 0)
         
         # Apply transformer
         text_features = self.transformer_encoder(
             x,
-            src_key_padding_mask=text_mask
+            src_key_padding_mask=padding_mask
         )
         
         # Pool for fusion (mean pooling over non-padding tokens)
-        mask_expanded = (~text_mask).unsqueeze(-1).float()  # [batch, seq_len, 1]
+        mask_expanded = (~padding_mask).unsqueeze(-1).float()  # [batch, seq_len, 1]
         pooled_features = (text_features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
         
         return text_features, pooled_features
@@ -398,6 +403,13 @@ class TranscriptionHead(nn.Module):
     ):
         super().__init__()
         self.max_length = max_length
+        self.embed_dim = embed_dim
+        
+        # Token embedding for target sequence
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(embed_dim, max_length, dropout)
         
         # Decoder transformer
         decoder_layer = nn.TransformerDecoderLayer(
@@ -413,32 +425,48 @@ class TranscriptionHead(nn.Module):
         # Output projection to vocabulary
         self.output_projection = nn.Linear(embed_dim, vocab_size)
         
-        # Learnable start token
+        # Learnable start token embedding
         self.start_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         
     def forward(
         self,
         memory: torch.Tensor,  # [batch, memory_len, embed_dim] - from torso
         memory_mask: Optional[torch.Tensor] = None,
-        target_seq: Optional[torch.Tensor] = None,  # [batch, tgt_len, embed_dim] - for training
+        target_indices: Optional[torch.Tensor] = None,  # [batch, tgt_len] - token indices for training
         target_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
+        Args:
+            memory: Encoded vision/context features [batch, memory_len, embed_dim]
+            memory_mask: Mask for memory (True for padding)
+            target_indices: Target token indices [batch, tgt_len] for teacher forcing
+            target_mask: Mask for target sequence
+            
         Returns:
             logits: [batch, seq_len, vocab_size]
         """
         batch_size = memory.size(0)
         
-        if target_seq is None:
-            # Inference mode - use start token
+        if target_indices is None:
+            # Inference mode - use start token only (will need autoregressive generation)
             target_seq = self.start_token.expand(batch_size, 1, -1)
+        else:
+            # Training mode - embed target tokens and add positional encoding
+            target_seq = self.token_embedding(target_indices)  # [batch, tgt_len, embed_dim]
+            target_seq = self.pos_encoder(target_seq)
+        
+        # Convert memory_mask to proper format (True = padding)
+        if memory_mask is not None and memory_mask.dtype != torch.bool:
+            memory_key_padding_mask = (memory_mask != 0)
+        else:
+            memory_key_padding_mask = memory_mask
         
         # Decode
         output = self.decoder(
             target_seq,
             memory,
             tgt_key_padding_mask=target_mask,
-            memory_key_padding_mask=memory_mask
+            memory_key_padding_mask=memory_key_padding_mask
         )
         
         # Project to vocabulary
@@ -647,7 +675,7 @@ class SophiaTransformerModel(nn.Module):
         transcription_logits = self.transcription_head(
             memory=enriched_features,
             memory_mask=fused_mask,
-            target_seq=target_text  # None during inference
+            target_indices=text_indices  # Pass token indices for teacher forcing during training
         )
         outputs['transcription_logits'] = transcription_logits
         

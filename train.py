@@ -448,7 +448,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, model_type,
             if 'images' in kwargs:
                 kwargs['rti_images'] = kwargs.pop('images')
             outputs = model(**kwargs)
-            logits = outputs['transcription']
+            logits = outputs['transcription_logits']
         else:
             logits = model(
                 input_ids=input_ids,
@@ -508,7 +508,7 @@ def validate(model, dataloader, criterion, device, model_type,
                 if 'images' in kwargs:
                     kwargs['rti_images'] = kwargs.pop('images')
                 outputs = model(**kwargs)
-                logits = outputs['transcription']
+                logits = outputs['transcription_logits']
             else:
                 logits = model(
                     input_ids=input_ids,
