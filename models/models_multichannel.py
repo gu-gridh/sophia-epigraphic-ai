@@ -472,15 +472,15 @@ class MultiChannelModel(nn.Module):
         
         return language_ids, writing_system_ids
         
-    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None,
+    def forward(self, input_ids, attention_mask=None, images=None, languages=None, writing_systems=None,
                 korniienko_photo=None, korniienko_drawing=None):
         """
         Forward pass with optional language conditioning and Korniienko images.
         
         Args:
-            images: [batch, 12, H, W] - RTI images (4 types × 3 RGB)
             input_ids: [batch, seq_len] - Token IDs for decoding
             attention_mask: [batch, seq_len] - Attention mask
+            images: [batch, 12, H, W] - RTI images (4 types × 3 RGB, optional)
             languages: List of language strings
             writing_systems: List of writing system strings
             korniienko_photo: [batch, 3, H, W] - Optional Korniienko photograph
@@ -489,6 +489,12 @@ class MultiChannelModel(nn.Module):
         Returns:
             logits: [batch, seq_len, vocab_size] - Output logits
         """
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+        
+        # If no RTI images provided, create zeros
+        if images is None:
+            images = torch.zeros(batch_size, 12, 224, 224, device=device)
         
         # Vision encoding with multi-channel processing + Korniienko
         vision_features = self.vision_encoder(

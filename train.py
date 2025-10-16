@@ -223,15 +223,25 @@ class SophiaMultiModalDataset(Dataset):
     
     def _check_korniienko_images(self, row):
         """Check if Korniienko images exist."""
-        isialy_id = row.get('isialy_id', row.get('id', ''))
-        if pd.isna(isialy_id):
+        # Check if CSV has Korniienko paths
+        photo_path_str = row.get('korniienko_photo', '')
+        drawing_path_str = row.get('korniienko_drawing', '')
+        
+        if pd.isna(photo_path_str) and pd.isna(drawing_path_str):
             return False
         
-        korniienko_dir = self.data_dir / 'korniienko_images' / isialy_id
-        photo_path = korniienko_dir / 'photo.jpg'
-        drawing_path = korniienko_dir / 'drawing.jpg'
+        # Check if at least one image exists
+        if not pd.isna(photo_path_str):
+            photo_path = self.data_dir / 'data' / photo_path_str
+            if photo_path.exists():
+                return True
         
-        return photo_path.exists() or drawing_path.exists()
+        if not pd.isna(drawing_path_str):
+            drawing_path = self.data_dir / 'data' / drawing_path_str
+            if drawing_path.exists():
+                return True
+        
+        return False
     
     def __len__(self):
         return len(self.df)
@@ -266,7 +276,7 @@ class SophiaMultiModalDataset(Dataset):
         
         # Load Korniienko images
         if self.use_korniienko:
-            photo, drawing = self._load_korniienko_images(isialy_id)
+            photo, drawing = self._load_korniienko_images(row)
             item['korniienko_photo'] = photo
             item['korniienko_drawing'] = drawing
         
@@ -301,25 +311,34 @@ class SophiaMultiModalDataset(Dataset):
         rti_tensor = torch.cat(channels, dim=0)
         return rti_tensor
     
-    def _load_korniienko_images(self, isialy_id):
-        """Load Korniienko photo and drawing."""
-        korniienko_dir = self.data_dir / 'korniienko_images' / isialy_id
+    def _load_korniienko_images(self, row):
+        """Load Korniienko photo and drawing from CSV paths."""
+        photo_tensor = None
+        drawing_tensor = None
         
-        # Load photo
-        photo_path = korniienko_dir / 'photo.jpg'
-        if photo_path.exists():
-            photo = Image.open(photo_path).convert('RGB')
-            photo_tensor = self.transform(photo)
-        else:
-            photo_tensor = None
+        # Load photo if path exists in CSV
+        photo_path_str = row.get('korniienko_photo', '')
+        if not pd.isna(photo_path_str) and photo_path_str:
+            photo_path = self.data_dir / 'data' / photo_path_str
+            if photo_path.exists():
+                try:
+                    photo = Image.open(photo_path).convert('RGB')
+                    photo_tensor = self.transform(photo)
+                except Exception as e:
+                    print(f"Warning: Failed to load photo {photo_path}: {e}")
+                    photo_tensor = None
         
-        # Load drawing
-        drawing_path = korniienko_dir / 'drawing.jpg'
-        if drawing_path.exists():
-            drawing = Image.open(drawing_path).convert('RGB')
-            drawing_tensor = self.transform(drawing)
-        else:
-            drawing_tensor = None
+        # Load drawing if path exists in CSV
+        drawing_path_str = row.get('korniienko_drawing', '')
+        if not pd.isna(drawing_path_str) and drawing_path_str:
+            drawing_path = self.data_dir / 'data' / drawing_path_str
+            if drawing_path.exists():
+                try:
+                    drawing = Image.open(drawing_path).convert('RGB')
+                    drawing_tensor = self.transform(drawing)
+                except Exception as e:
+                    print(f"Warning: Failed to load drawing {drawing_path}: {e}")
+                    drawing_tensor = None
         
         return photo_tensor, drawing_tensor
 
@@ -345,15 +364,27 @@ def collate_fn(batch):
     if 'rti_images' in batch[0]:
         result['rti_images'] = torch.stack([item['rti_images'] for item in batch])
     
-    # Handle Korniienko photo (may have None values)
+    # Handle Korniienko photo (replace None with zeros to maintain batch size)
     if 'korniienko_photo' in batch[0]:
-        photos = [item['korniienko_photo'] for item in batch if item['korniienko_photo'] is not None]
-        result['korniienko_photo'] = torch.stack(photos) if photos else None
+        photos = []
+        for item in batch:
+            if item['korniienko_photo'] is not None:
+                photos.append(item['korniienko_photo'])
+            else:
+                # Create zero tensor with same shape as others
+                photos.append(torch.zeros(3, 224, 224))  # Assuming 224x224 images
+        result['korniienko_photo'] = torch.stack(photos)
     
-    # Handle Korniienko drawing (may have None values)
+    # Handle Korniienko drawing (replace None with zeros to maintain batch size)
     if 'korniienko_drawing' in batch[0]:
-        drawings = [item['korniienko_drawing'] for item in batch if item['korniienko_drawing'] is not None]
-        result['korniienko_drawing'] = torch.stack(drawings) if drawings else None
+        drawings = []
+        for item in batch:
+            if item['korniienko_drawing'] is not None:
+                drawings.append(item['korniienko_drawing'])
+            else:
+                # Create zero tensor with same shape as others
+                drawings.append(torch.zeros(3, 224, 224))  # Assuming 224x224 images
+        result['korniienko_drawing'] = torch.stack(drawings)
     
     return result
 

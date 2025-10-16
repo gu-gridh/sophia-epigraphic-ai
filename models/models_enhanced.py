@@ -444,15 +444,15 @@ class EnhancedModel(nn.Module):
         self.model_type = "enhanced_v2"
         self.description = f"Deep vision + 8-layer transformer + language conditioning (vocab:{vocab_size})"
         
-    def forward(self, images, input_ids, attention_mask=None, languages=None, writing_systems=None,
+    def forward(self, input_ids, attention_mask=None, images=None, languages=None, writing_systems=None,
                 korniienko_photo=None, korniienko_drawing=None):
         """
         Enhanced forward pass with language conditioning and multi-modal fusion.
         
         Args:
-            images: RTI images [batch_size, 12, height, width]
             input_ids: Token IDs [batch_size, seq_length]
             attention_mask: Attention mask [batch_size, seq_length]
+            images: RTI images [batch_size, 12, height, width] (optional)
             languages: Language IDs [batch_size]
             writing_systems: Writing system IDs [batch_size]
             korniienko_photo: Optional Korniienko photo [batch_size, 3, height, width]
@@ -461,6 +461,13 @@ class EnhancedModel(nn.Module):
         Returns:
             logits: Character predictions [batch_size, seq_length, vocab_size]
         """
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+        
+        # If no RTI images provided, create zeros
+        if images is None:
+            images = torch.zeros(batch_size, 12, 224, 224, device=device)
+        
         # Deep vision encoding with attention and multi-modal fusion
         vision_features = self.vision_encoder(
             images, 
