@@ -857,7 +857,14 @@ Examples:
                 'train_loss': train_loss,
                 'val_loss': val_loss,
                 'best_val_loss': best_val_loss,
-                'config': vars(args)
+                'config': vars(args),
+                'num_languages': train_dataset.num_languages,
+                'num_writing_systems': train_dataset.num_writing_systems,
+                'language_to_idx': train_dataset.language_to_idx,
+                'idx_to_language': train_dataset.idx_to_language,
+                'ws_to_idx': train_dataset.ws_to_idx,
+                'idx_to_ws': train_dataset.idx_to_ws,
+                'vocab_size': vocab_size
             }, checkpoint_path)
             
             print(f" Checkpoint saved: {checkpoint_path}")
@@ -870,7 +877,14 @@ Examples:
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'val_loss': val_loss,
-                    'config': vars(args)
+                    'config': vars(args),
+                    'num_languages': train_dataset.num_languages,
+                    'num_writing_systems': train_dataset.num_writing_systems,
+                    'language_to_idx': train_dataset.language_to_idx,
+                    'idx_to_language': train_dataset.idx_to_language,
+                    'ws_to_idx': train_dataset.ws_to_idx,
+                    'idx_to_ws': train_dataset.idx_to_ws,
+                    'vocab_size': vocab_size
                 }, best_model_path)
                 print(f" Best model saved: {best_model_path} (val_loss: {val_loss:.4f})")
     
@@ -885,7 +899,14 @@ Examples:
     torch.save({
         'epoch': args.epochs - 1,
         'model_state_dict': model.state_dict(),
-        'config': vars(args)
+        'config': vars(args),
+        'num_languages': train_dataset.num_languages,
+        'num_writing_systems': train_dataset.num_writing_systems,
+        'language_to_idx': train_dataset.language_to_idx,
+        'idx_to_language': train_dataset.idx_to_language,
+        'ws_to_idx': train_dataset.ws_to_idx,
+        'idx_to_ws': train_dataset.idx_to_ws,
+        'vocab_size': vocab_size
     }, final_model_path)
     print(f" Final model saved: {final_model_path}")
     

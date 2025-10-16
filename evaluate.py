@@ -169,6 +169,74 @@ def decode_prediction(logits, tokenizer):
     return predictions
 
 
+def generate_text_transformer(model, tokenizer, max_length=512, **kwargs):
+    """
+    Autoregressive text generation for transformer model.
+    
+    Args:
+        model: The transformer model
+        tokenizer: XLM-RoBERTa tokenizer
+        max_length: Maximum sequence length to generate
+        **kwargs: Model inputs (rti_images, korniienko_photo, etc.)
+    
+    Returns:
+        texts: List of generated text strings
+    """
+    batch_size = kwargs.get('rti_images', kwargs.get('korniienko_photo')).size(0)
+    device = kwargs.get('rti_images', kwargs.get('korniienko_photo')).device
+    
+    # Start with BOS token
+    generated_ids = torch.full((batch_size, 1), tokenizer.bos_token_id, 
+                              dtype=torch.long, device=device)
+    
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+    # Generate tokens one at a time
+    for step in range(max_length - 1):
+        # Pass generated tokens so far
+        outputs = model(
+            **kwargs,
+            text_indices=generated_ids,
+            text_mask=None
+        )
+        
+        logits = outputs['transcription_logits']  # [batch, seq_len, vocab]
+        
+        # Get next token (greedy)
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [batch, 1]
+        
+        # Check for EOS or repetition
+        is_eos = (next_token.squeeze(-1) == tokenizer.eos_token_id)
+        finished = finished | is_eos
+        
+        # Stop if all sequences finished
+        if finished.all():
+            break
+        
+        # Check for repetition (if last 5 tokens are the same, stop)
+        if step >= 5 and generated_ids.size(1) >= 6:
+            last_5 = generated_ids[:, -5:]
+            is_repeating = (last_5 == last_5[:, :1]).all(dim=1)
+            finished = finished | is_repeating
+            
+            if finished.all():
+                break
+        
+        # Append to sequence (don't append if finished)
+        next_token = torch.where(finished.unsqueeze(-1), 
+                                torch.full_like(next_token, tokenizer.pad_token_id),
+                                next_token)
+        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+    
+    # Decode to text
+    texts = []
+    for ids in generated_ids:
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        texts.append(text.strip())
+    
+    return texts
+
+
 def evaluate_model(model, dataloader, tokenizer, device, model_type,
                    use_rti=True, use_korniienko=True):
     """
@@ -207,12 +275,12 @@ def evaluate_model(model, dataloader, tokenizer, device, model_type,
             
             # Forward pass
             if model_type == 'transformer':
-                kwargs['text_indices'] = input_ids
-                kwargs['text_mask'] = attention_mask
+                # Use autoregressive generation for transformer
                 if 'images' in kwargs:
                     kwargs['rti_images'] = kwargs.pop('images')
-                outputs = model(**kwargs)
-                logits = outputs['transcription']
+                predictions = generate_text_transformer(
+                    model, tokenizer, max_length=256, **kwargs
+                )
             else:
                 logits = model(
                     input_ids=input_ids,
@@ -221,9 +289,8 @@ def evaluate_model(model, dataloader, tokenizer, device, model_type,
                     writing_systems=writing_systems,
                     **kwargs
                 )
-            
-            # Decode predictions
-            predictions = decode_prediction(logits, tokenizer)
+                # Decode predictions
+                predictions = decode_prediction(logits, tokenizer)
             
             # Store results
             all_predictions.extend(predictions)
@@ -585,6 +652,15 @@ def main():
     
     # Create dataset
     print("\n Loading test dataset...")
+    # Determine split from CSV filename
+    csv_filename = Path(args.test_csv).stem  # 'test_comprehensive', 'val_comprehensive', etc.
+    if 'test' in csv_filename:
+        split = 'test'
+    elif 'val' in csv_filename:
+        split = 'val'
+    else:
+        split = 'test'  # default
+    
     test_dataset = SophiaMultiModalDataset(
         csv_file=Path(args.data_dir) / args.test_csv,
         data_dir=args.data_dir,
@@ -594,7 +670,8 @@ def main():
         use_korniienko=args.use_korniienko,
         model_type=args.model,
         image_size=args.image_size,
-        augment=False
+        augment=False,
+        split=split
     )
     
     print(f"✓ Test samples: {len(test_dataset)}")
@@ -615,11 +692,28 @@ def main():
     
     # Create model
     print("\n  Creating model...")
+    
+    # Check if checkpoint has language/writing system info (new format)
+    # If not, we need to use training dataset counts to match the trained model
+    if 'num_languages' in checkpoint and 'num_writing_systems' in checkpoint:
+        num_languages = checkpoint['num_languages']
+        num_writing_systems = checkpoint['num_writing_systems']
+        print(f"  Using checkpoint metadata: {num_languages} languages, {num_writing_systems} writing systems")
+    else:
+        # Old checkpoint format - load training dataset to get correct counts
+        print("  ⚠️  Old checkpoint format detected. Loading training dataset to determine model dimensions...")
+        import pandas as pd
+        train_df = pd.read_csv('data/train_comprehensive.csv')
+        # Count unique languages and writing systems from training data
+        num_languages = train_df['language_name'].nunique() + 1  # +1 for unknown
+        num_writing_systems = train_df['writing_system_name'].nunique() + 1
+        print(f"  Using training dataset counts: {num_languages} languages, {num_writing_systems} writing systems")
+    
     model = create_model(
         model_type=args.model,
         vocab_size=vocab_size,
-        num_languages=test_dataset.num_languages,
-        num_writing_systems=test_dataset.num_writing_systems,
+        num_languages=num_languages,
+        num_writing_systems=num_writing_systems,
         use_korniienko=args.use_korniienko
     )
     
