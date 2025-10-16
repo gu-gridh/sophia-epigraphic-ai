@@ -298,11 +298,37 @@ class LanguageConditionedDecoder(nn.Module):
         }
     
     def get_language_conditioning(self, languages, writing_systems, device):
-        """Generate language conditioning vectors."""
-        batch_size = len(languages) if languages else 1
+        """Generate language conditioning vectors.
         
-        if languages and writing_systems:
-            # Map language and writing system names to indices
+        Args:
+            languages: Tensor of language indices [batch_size] or None
+            writing_systems: Tensor of writing system indices [batch_size] or None
+            device: Device to create tensors on
+        """
+        # Handle None or empty inputs
+        if languages is None or (isinstance(languages, torch.Tensor) and languages.numel() == 0):
+            batch_size = 1
+            conditioning = torch.zeros(batch_size, self.hidden_dim, device=device)
+            return conditioning
+        
+        # Get batch size from tensor
+        batch_size = languages.size(0) if isinstance(languages, torch.Tensor) else len(languages)
+        
+        # If languages and writing_systems are already tensors (indices), use them directly
+        if isinstance(languages, torch.Tensor) and isinstance(writing_systems, torch.Tensor):
+            lang_tensor = languages.to(device)
+            ws_tensor = writing_systems.to(device)
+            
+            # Get embeddings
+            lang_emb = self.language_embedding(lang_tensor)
+            ws_emb = self.writing_system_embedding(ws_tensor)
+            
+            # Combine language and writing system embeddings
+            combined = torch.cat([lang_emb, ws_emb], dim=-1)
+            conditioning = self.language_projection(combined)
+            
+        else:
+            # Legacy path: if they're string names, map them to indices
             lang_indices = []
             ws_indices = []
             
@@ -326,10 +352,6 @@ class LanguageConditionedDecoder(nn.Module):
             # Combine language and writing system embeddings
             combined = torch.cat([lang_emb, ws_emb], dim=-1)
             conditioning = self.language_projection(combined)
-            
-        else:
-            # Default conditioning for unknown languages
-            conditioning = torch.zeros(batch_size, self.hidden_dim, device=device)
         
         return conditioning
     
