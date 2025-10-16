@@ -275,12 +275,15 @@ def evaluate_model(model, dataloader, tokenizer, device, model_type,
             
             # Forward pass
             if model_type == 'transformer':
-                # Use autoregressive generation for transformer
+                # Use teacher forcing for transformer (since autoregressive fails)
+                kwargs['text_indices'] = input_ids
+                kwargs['text_mask'] = attention_mask
                 if 'images' in kwargs:
                     kwargs['rti_images'] = kwargs.pop('images')
-                predictions = generate_text_transformer(
-                    model, tokenizer, max_length=256, **kwargs
-                )
+                outputs = model(**kwargs)
+                logits = outputs['transcription_logits']
+                # Decode predictions
+                predictions = decode_prediction(logits, tokenizer)
             else:
                 logits = model(
                     input_ids=input_ids,
