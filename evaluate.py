@@ -148,7 +148,7 @@ def calculate_wer(reference, hypothesis):
 
 
 def decode_prediction(logits, tokenizer):
-    """Decode model output to text."""
+    """Decode model output to text with proper EOS handling and cleaning."""
     # Get predicted tokens (greedy decoding)
     predicted_ids = torch.argmax(logits, dim=-1)  # [batch, seq_len]
     
@@ -157,14 +157,51 @@ def decode_prediction(logits, tokenizer):
         # Remove padding and special tokens
         ids = ids.cpu().numpy()
         
-        if hasattr(tokenizer, 'decode'):
+        # Check if it's XLM-RoBERTa tokenizer (has vocab_file attribute) or Character tokenizer
+        if hasattr(tokenizer, 'vocab_file') or tokenizer.__class__.__name__ == 'XLMRobertaTokenizer':
             # XLM-RoBERTa tokenizer
             text = tokenizer.decode(ids, skip_special_tokens=True)
         else:
-            # Character tokenizer
-            text = tokenizer.decode(ids)
+            # Character tokenizer - improved decoding
+            chars = []
+            for idx in ids:
+                # Skip special tokens
+                if idx in [0, 1]:  # PAD, SOS
+                    continue
+                if idx == 2:  # EOS - stop here!
+                    break
+                    
+                # Get character (with fallback for unknown indices)
+                if idx in tokenizer.idx_to_char:
+                    char = tokenizer.idx_to_char[idx]
+                    # Skip <UNK> token (index 3)
+                    if idx == 3:
+                        continue
+                    chars.append(char)
+                # If index out of vocab range, skip it
+                
+            text = ''.join(chars)
         
-        predictions.append(text.strip())
+        # Clean up the prediction
+        text = text.strip()
+        
+        # Remove excessive repetition at the end (common issue)
+        # If last 10+ characters are all the same, trim them
+        if len(text) > 10:
+            last_char = text[-1]
+            # Count how many times it repeats at the end
+            repeat_count = 0
+            for i in range(len(text) - 1, -1, -1):
+                if text[i] == last_char:
+                    repeat_count += 1
+                else:
+                    break
+            
+            # If more than 10 repetitions, it's likely garbage - remove them
+            if repeat_count > 10:
+                text = text[:-repeat_count].rstrip()
+        
+        predictions.append(text)
     
     return predictions
 
@@ -568,6 +605,11 @@ def main():
     parser.add_argument('--max_length', type=int, default=128,
                         help='Maximum text sequence length')
     
+    # Tokenizer selection
+    parser.add_argument('--tokenizer', type=str, default='xlm',
+                        choices=['xlm', 'character'],
+                        help='Tokenizer type: xlm (XLM-RoBERTa) or character (character-level)')
+    
     # Output
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Output directory (auto-generated if not provided)')
@@ -639,19 +681,26 @@ def main():
     
     # Initialize tokenizer
     print("\n Initializing tokenizer...")
-    if XLMRobertaTokenizer is not None:
-        try:
-            tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
-            vocab_size = tokenizer.vocab_size
-            print(f" XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
-        except:
-            print("  XLM-RoBERTa failed, using character tokenizer")
-            tokenizer = CharacterTokenizer()
-            vocab_size = tokenizer.vocab_size
-    else:
+    if args.tokenizer == 'character':
         tokenizer = CharacterTokenizer()
         vocab_size = tokenizer.vocab_size
-        print(f"✓ Character tokenizer initialized (vocab size: {vocab_size})")
+        print(f"✓ Character-level tokenizer loaded (vocab size: {vocab_size})")
+        print(f"  ✓ Preserves all ancient Cyrillic characters (ꙗ, ꙅ, ѧ, etc.)")
+    else:  # xlm
+        if XLMRobertaTokenizer is not None:
+            try:
+                tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
+                vocab_size = tokenizer.vocab_size
+                print(f" XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
+                print(f"   Warning: May corrupt ancient Cyrillic characters")
+            except:
+                print("  XLM-RoBERTa failed, falling back to character tokenizer")
+                tokenizer = CharacterTokenizer()
+                vocab_size = tokenizer.vocab_size
+        else:
+            print("  XLM-RoBERTa not available, using character tokenizer")
+            tokenizer = CharacterTokenizer()
+            vocab_size = tokenizer.vocab_size
     
     # Create dataset
     print("\n Loading test dataset...")
@@ -664,8 +713,11 @@ def main():
     else:
         split = 'test'  # default
     
+    # Handle CSV paths - if they contain 'data/', remove it since data_dir already points to data/
+    test_csv_path = args.test_csv.replace('data/', '') if 'data/' in args.test_csv else args.test_csv
+    
     test_dataset = SophiaMultiModalDataset(
-        csv_file=Path(args.data_dir) / args.test_csv,
+        csv_file=Path(args.data_dir) / test_csv_path,
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         max_length=args.max_length,
@@ -704,7 +756,7 @@ def main():
         print(f"  Using checkpoint metadata: {num_languages} languages, {num_writing_systems} writing systems")
     else:
         # Old checkpoint format - load training dataset to get correct counts
-        print("  ⚠️  Old checkpoint format detected. Loading training dataset to determine model dimensions...")
+        print("  Old checkpoint format detected. Loading training dataset to determine model dimensions...")
         import pandas as pd
         train_df = pd.read_csv('data/train_comprehensive.csv')
         # Count unique languages and writing systems from training data

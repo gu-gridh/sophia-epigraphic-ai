@@ -46,9 +46,21 @@ class CharacterTokenizer:
         
         # Add common characters (Greek, Latin, Cyrillic, numbers, punctuation)
         chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        chars += "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω"
+        # Greek (including extended)
+        chars += "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψωϫ"
+        # Standard Cyrillic
         chars += "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-        chars += "0123456789.,;:!?-–—'\"()[]{}/@#$%&*+=<>|\\~`"
+        # Ancient/Extended Cyrillic (CRITICAL for Saint Sophia!)
+        chars += "ЄІєіѕѣѥѦѧѩѫѯѰѱѲѵѿ҂"  # iotified letters, yus, fita, izhitsa, etc.
+        chars += "ꙀꙁꙂꙃꙄꙅꙆꙇꙈꙉꙊꙋꙌꙍꙎꙏꙐꙑꙒꙓꙔꙕꙖꙗꙘꙙꙚꙛꙜꙝꙞꙟꙠꙡꙢꙣ"  # Extended Cyrillic Supplement
+        # Armenian
+        chars += "ԱԲԳԴԵԶԷԸԹԺԻԼԽԾԿՀՁՂՃՄՅՆՇՈՉՊՋՌՍՎՏՐՑՒՓՔՕՖաբգդեզէըթժիլխծկհձղճմյնշոչպջռսվտրցւփքօֆ"
+        # Numbers and punctuation
+        chars += "0123456789०१२३४५६७८९୳၊"  # Latin + Devanagari + Oriya + Myanmar
+        chars += ".,;:!?-–—'\"()[]{}/@#$%&*+=<>|\\~`_"
+        # Special symbols
+        chars += "✠ⰰⰱⰲⰳⰴⰵⰶⰷⰸⰹⰺⰻⰼⰽⰾⰿⱀⱁⱂⱃⱄⱅⱆⱇⱈⱉⱊⱋⱌⱍⱎⱏⱐⱑⱒⱓⱔⱕⱖⱗⱘⱙⱚⱛⱜⱝⱞ"  # Glagolitic + Cross
+        # Whitespace
         chars += " \n\t"
         
         for idx, char in enumerate(chars, start=4):
@@ -133,6 +145,8 @@ class SophiaMultiModalDataset(Dataset):
         """
         self.df = pd.read_csv(csv_file)
         self.data_dir = Path(data_dir)
+        self.rti_dir = self.data_dir  # RTI images paths are relative to data/ directory
+        self.korniienko_dir = self.data_dir  # Korniienko images are in data/ directory
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.use_rti = use_rti
@@ -158,9 +172,11 @@ class SophiaMultiModalDataset(Dataset):
         if augment:
             return transforms.Compose([
                 transforms.Resize((self.image_size, self.image_size)),
-                transforms.RandomHorizontalFlip(p=0.3),
-                transforms.RandomRotation(5),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # Add translation
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # Add blur
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5], std=[0.5])
             ])
@@ -209,12 +225,20 @@ class SophiaMultiModalDataset(Dataset):
     
     def _check_rti_images(self, row):
         """Check if RTI images exist."""
+        # First try to use CSV columns (preferred method)
+        for img_type in ['original', 'blended', 'normal', 'texture']:
+            col_name = f"{img_type}_image"
+            if col_name in row.index and pd.notna(row[col_name]):
+                img_path = self.data_dir / str(row[col_name])
+                if img_path.exists():
+                    return True
+        
+        # Fallback: try old structure with isialy_id
         isialy_id = row.get('isialy_id', row.get('id', ''))
         if pd.isna(isialy_id):
             return False
         
-        # Check for at least one RTI type in the correct split directory
-        rti_dir = self.data_dir / 'data' / 'cropped_images_hq' / self.split
+        rti_dir = self.data_dir / 'cropped_images_hq' / self.split
         for img_type in ['original', 'blended', 'normal', 'texture']:
             img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
             if img_path.exists():
@@ -232,12 +256,12 @@ class SophiaMultiModalDataset(Dataset):
         
         # Check if at least one image exists
         if not pd.isna(photo_path_str):
-            photo_path = self.data_dir / 'data' / photo_path_str
+            photo_path = self.data_dir / str(photo_path_str)
             if photo_path.exists():
                 return True
         
         if not pd.isna(drawing_path_str):
-            drawing_path = self.data_dir / 'data' / drawing_path_str
+            drawing_path = self.data_dir / str(drawing_path_str)
             if drawing_path.exists():
                 return True
         
@@ -261,33 +285,115 @@ class SophiaMultiModalDataset(Dataset):
             truncation=True
         )
         
-        # Load images
-        item = {
+        # Load RTI images (4 types × 3 RGB = 12 channels)
+        rti_images = []
+        rti_types = ['original', 'blended', 'normal', 'texture']
+        
+        for rti_type in rti_types:
+            # Try to get path from CSV column (e.g., 'original_image', 'blended_image')
+            col_name = f"{rti_type}_image"
+            
+            if col_name in row.index and pd.notna(row[col_name]):
+                # CSV has relative path, prepend data_dir
+                img_path = os.path.join(self.data_dir, str(row[col_name]))
+            else:
+                # Fallback: try old structure with isialy_id
+                img_path = os.path.join(self.rti_dir, str(isialy_id), f"{rti_type}.jpg")
+            
+            if os.path.exists(img_path):
+                img = Image.open(img_path).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                rti_images.append(img)
+            else:
+                # Create blank image if missing
+                blank = torch.zeros(3, self.image_size, self.image_size)
+                rti_images.append(blank)
+        
+        # Stack RTI images: [4, 3, H, W] -> [12, H, W]
+        rti_tensor = torch.cat(rti_images, dim=0)
+        
+        # Load Korniienko PHOTO (photograph)
+        korniienko_photo_tensor = None
+        korniienko_photo_path = None
+        
+        # Try different possible column names and path formats
+        possible_photo_cols = ['korniienko_photo', 'korniienko_photo_path', 'korniienko_image']
+        for col in possible_photo_cols:
+            if col in row and pd.notna(row[col]):
+                # Could be full path or just filename
+                photo_value = str(row[col])
+                
+                # Try different path constructions
+                possible_paths = [
+                    photo_value,  # Full path from CSV
+                    os.path.join(self.korniienko_dir, photo_value),  # korniienko_images/filename
+                    os.path.join(self.korniienko_dir, f"{isialy_id}_photo.jpg"),  # Standard naming
+                    os.path.join(self.korniienko_dir, f"{isialy_id}.jpg"),  # Simple naming
+                ]
+                
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        korniienko_photo_path = path
+                        break
+                
+                if korniienko_photo_path:
+                    break
+        
+        if korniienko_photo_path and os.path.exists(korniienko_photo_path):
+            img = Image.open(korniienko_photo_path).convert('RGB')
+            if self.transform:
+                img = self.transform(img)
+            korniienko_photo_tensor = img
+        else:
+            # Create blank if missing
+            korniienko_photo_tensor = torch.zeros(3, self.image_size, self.image_size)
+        
+        # Load Korniienko DRAWING (tracing/drawing)
+        korniienko_drawing_tensor = None
+        korniienko_drawing_path = None
+        
+        possible_drawing_cols = ['korniienko_drawing', 'korniienko_drawing_path']
+        for col in possible_drawing_cols:
+            if col in row and pd.notna(row[col]):
+                drawing_value = str(row[col])
+                
+                possible_paths = [
+                    drawing_value,
+                    os.path.join(self.korniienko_dir, drawing_value),
+                    os.path.join(self.korniienko_dir, f"{isialy_id}_drawing.jpg"),
+                    os.path.join(self.korniienko_dir, f"{isialy_id}_tracing.jpg"),
+                ]
+                
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        korniienko_drawing_path = path
+                        break
+                
+                if korniienko_drawing_path:
+                    break
+        
+        if korniienko_drawing_path and os.path.exists(korniienko_drawing_path):
+            img = Image.open(korniienko_drawing_path).convert('RGB')  # Convert to RGB even if grayscale
+            if self.transform:
+                img = self.transform(img)
+            korniienko_drawing_tensor = img
+        else:
+            # Create blank if missing
+            korniienko_drawing_tensor = torch.zeros(3, self.image_size, self.image_size)
+        
+        # Prepare output
+        return {
+            'rti_images': rti_tensor,  # [12, H, W]
+            'korniienko_photo': korniienko_photo_tensor,  # [3, H, W]
+            'korniienko_drawing': korniienko_drawing_tensor,  # [3, H, W]
             'input_ids': torch.tensor(encoded['input_ids'], dtype=torch.long),
             'attention_mask': torch.tensor(encoded['attention_mask'], dtype=torch.long),
+            'language': self.language_to_idx.get(row.get('language_name', 'unknown'), 0),
+            'writing_system': self.ws_to_idx.get(row.get('writing_system_name', 'unknown'), 0),
             'transcription': transcription,
             'isialy_id': isialy_id
         }
-        
-        # Load RTI images (12 channels)
-        if self.use_rti:
-            rti_images = self._load_rti_images(isialy_id)
-            item['rti_images'] = rti_images
-        
-        # Load Korniienko images
-        if self.use_korniienko:
-            photo, drawing = self._load_korniienko_images(row)
-            item['korniienko_photo'] = photo
-            item['korniienko_drawing'] = drawing
-        
-        # Load metadata
-        language = row.get('language_name', 'unknown')
-        writing_system = row.get('writing_system_name', 'unknown')
-        
-        item['language'] = self.language_to_idx.get(language, 0)
-        item['writing_system'] = self.ws_to_idx.get(writing_system, 0)
-        
-        return item
     
     def _load_rti_images(self, isialy_id):
         """Load and stack RTI images (4 types × 3 RGB = 12 channels)."""
@@ -455,10 +561,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, model_type,
         optimizer.zero_grad()
         
         # Move to device
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        languages = batch['language'].to(device)
-        writing_systems = batch['writing_system'].to(device)
+        rti_images = batch['rti_images'].to(device)
+        korniienko_photo = batch['korniienko_photo'].to(device)
+        korniienko_drawing = batch['korniienko_drawing'].to(device)
+        text_indices = batch['input_ids'].to(device)  # Use input_ids from collate_fn
+        text_mask = batch['attention_mask'].to(device)  # Use attention_mask from collate_fn
         
         # Prepare images
         kwargs = {}
@@ -472,27 +579,34 @@ def train_epoch(model, dataloader, optimizer, criterion, device, model_type,
             if batch.get('korniienko_drawing') is not None:
                 kwargs['korniienko_drawing'] = batch['korniienko_drawing'].to(device)
         
-        # Forward pass (different for transformer)
+        # Forward pass - different models have different signatures
         if model_type == 'transformer':
-            kwargs['text_indices'] = input_ids
-            kwargs['text_mask'] = attention_mask
-            if 'images' in kwargs:
-                kwargs['rti_images'] = kwargs.pop('images')
-            outputs = model(**kwargs)
+            # Transformer uses different parameter names and returns a dict
+            outputs = model(
+                rti_images=rti_images,
+                korniienko_photo=korniienko_photo,
+                korniienko_drawing=korniienko_drawing,
+                text_indices=text_indices,
+                text_mask=text_mask,
+                training=True
+            )
             logits = outputs['transcription_logits']
         else:
+            # Enhanced and MultiChannel models
             logits = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                languages=languages,
-                writing_systems=writing_systems,
-                **kwargs
+                input_ids=text_indices,
+                attention_mask=text_mask,
+                images=rti_images,
+                languages=batch.get('language'),
+                writing_systems=batch.get('writing_system'),
+                korniienko_photo=korniienko_photo,
+                korniienko_drawing=korniienko_drawing
             )
         
         # Compute loss
         loss = criterion(
             logits.view(-1, logits.size(-1)),
-            input_ids.view(-1)
+            text_indices.view(-1)
         )
         
         # Backward pass
@@ -586,10 +700,10 @@ Examples:
     parser.add_argument('--data_dir', type=str, 
                         default='/home/aram/GRIDH/Saint_Sophia/sophia-epigraphic-ai',
                         help='Base data directory')
-    parser.add_argument('--train_csv', type=str, default='data/train_comprehensive.csv',
-                        help='Training CSV file (relative to data_dir)')
-    parser.add_argument('--val_csv', type=str, default='data/val_comprehensive.csv',
-                        help='Validation CSV file (relative to data_dir)')
+    parser.add_argument('--train_csv', type=str, default='train_comprehensive.csv',
+                        help='Training CSV file (relative to data_dir/data/)')
+    parser.add_argument('--val_csv', type=str, default='val_comprehensive.csv',
+                        help='Validation CSV file (relative to data_dir/data/)')
     
     # Modality selection
     parser.add_argument('--use_rti', action='store_true', default=False,
@@ -614,6 +728,11 @@ Examples:
                         help='Input image size')
     parser.add_argument('--max_length', type=int, default=128,
                         help='Maximum text sequence length')
+    
+    # Tokenizer selection
+    parser.add_argument('--tokenizer', type=str, default='xlm',
+                        choices=['xlm', 'character'],
+                        help='Tokenizer type: xlm (XLM-RoBERTa) or character (character-level)')
     
     # Optimization
     parser.add_argument('--num_workers', type=int, default=4,
@@ -701,24 +820,36 @@ Examples:
     
     # Initialize tokenizer
     print("\n Initializing tokenizer...")
-    if XLMRobertaTokenizer is not None:
-        try:
-            tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
-            vocab_size = tokenizer.vocab_size
-            print(f"✓ XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
-        except:
-            print(" XLM-RoBERTa failed, using character tokenizer")
-            tokenizer = CharacterTokenizer()
-            vocab_size = tokenizer.vocab_size
-    else:
+    if args.tokenizer == 'character':
         tokenizer = CharacterTokenizer()
         vocab_size = tokenizer.vocab_size
-        print(f"✓ Character tokenizer initialized (vocab size: {vocab_size})")
+        print(f"✓ Character-level tokenizer loaded (vocab size: {vocab_size})")
+        print(f"  ✓ Preserves all ancient Cyrillic characters (ꙗ, ꙅ, ѧ, etc.)")
+    else:  # xlm
+        if XLMRobertaTokenizer is not None:
+            try:
+                tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
+                vocab_size = tokenizer.vocab_size
+                print(f"✓ XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
+                print(f"  Warning: May corrupt ancient Cyrillic characters")
+            except:
+                print(" XLM-RoBERTa failed, falling back to character tokenizer")
+                tokenizer = CharacterTokenizer()
+                vocab_size = tokenizer.vocab_size
+        else:
+            print(" XLM-RoBERTa not available, using character tokenizer")
+            tokenizer = CharacterTokenizer()
+            vocab_size = tokenizer.vocab_size
     
     # Create datasets
     print("\n Loading datasets...")
+    
+    # Handle CSV paths - if they contain 'data/', remove it since data_dir already points to data/
+    train_csv_path = args.train_csv.replace('data/', '') if 'data/' in args.train_csv else args.train_csv
+    val_csv_path = args.val_csv.replace('data/', '') if 'data/' in args.val_csv else args.val_csv
+    
     train_dataset = SophiaMultiModalDataset(
-        csv_file=Path(args.data_dir) / args.train_csv,
+        csv_file=Path(args.data_dir) / train_csv_path,
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         max_length=args.max_length,
@@ -731,7 +862,7 @@ Examples:
     )
     
     val_dataset = SophiaMultiModalDataset(
-        csv_file=Path(args.data_dir) / args.val_csv,
+        csv_file=Path(args.data_dir) / val_csv_path,
         data_dir=args.data_dir,
         tokenizer=tokenizer,
         max_length=args.max_length,
