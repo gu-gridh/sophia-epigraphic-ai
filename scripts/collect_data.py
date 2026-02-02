@@ -339,7 +339,7 @@ def main():
     print()
     
     # Step 1: Export graffiti inscriptions from API with full hierarchy (depth=1)
-    csv_filename = export_inscriptions_from_api(use_api=True)
+    csv_filename = export_inscriptions_from_api()
     
     if not csv_filename:
         print("Failed to export inscriptions!")

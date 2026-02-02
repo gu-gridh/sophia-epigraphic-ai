@@ -397,8 +397,8 @@ def clean_dataset(input_csv: str, output_csv: str, text_column: str = 'transcrip
 def main():
     """Main function to clean graffiti text in dataset."""
     
-    # Clean the main inscriptions dataset
-    input_file = '../data/inscriptions_graffiti_20251014_124018.csv'
+    # Clean the main inscriptions dataset - use the latest file
+    input_file = '../data/inscriptions_graffiti_20260202_132713.csv'
     output_file = '../data/inscriptions_graffiti_cleaned.csv'
     
     if os.path.exists(input_file):

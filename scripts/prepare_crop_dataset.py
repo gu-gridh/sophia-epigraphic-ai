@@ -85,9 +85,91 @@ def prepare_dataset(input_csv, output_csv):
     
     return df_valid
 
+
+def get_language_text(lang_str):
+    """Extract language text from JSON string."""
+    try:
+        if pd.isna(lang_str) or lang_str == '':
+            return 'Unknown'
+        lang_dict = eval(lang_str) if isinstance(lang_str, str) else lang_str
+        return lang_dict.get('text', 'Unknown') if isinstance(lang_dict, dict) else str(lang_str)
+    except:
+        return 'Unknown'
+
+
+def stratified_split_dataset(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_seed=42):
+    """
+    Split dataset into train/val/test sets with STRATIFIED sampling by language.
+    This ensures each split has proportional representation of all languages.
+    
+    Args:
+        df: DataFrame to split
+        train_ratio: Ratio for training set
+        val_ratio: Ratio for validation set
+        test_ratio: Ratio for test set
+        random_seed: Random seed for reproducibility
+        
+    Returns:
+        tuple: (train_df, val_df, test_df)
+    """
+    np.random.seed(random_seed)
+    
+    # Extract language text for stratification
+    df = df.copy()
+    df['_language_text'] = df['language'].apply(get_language_text)
+    
+    train_dfs = []
+    val_dfs = []
+    test_dfs = []
+    
+    print(f"\nStratified split by language:")
+    print("-" * 60)
+    
+    # Split each language group proportionally
+    for lang in df['_language_text'].unique():
+        lang_df = df[df['_language_text'] == lang].sample(frac=1, random_state=random_seed).reset_index(drop=True)
+        n = len(lang_df)
+        
+        if n < 3:
+            # Too few samples - put all in training
+            train_dfs.append(lang_df)
+            print(f"  {lang}: {n} samples (all in train - too few to split)")
+            continue
+        
+        train_end = max(1, int(n * train_ratio))
+        val_end = train_end + max(1, int(n * val_ratio))
+        
+        train_dfs.append(lang_df[:train_end])
+        val_dfs.append(lang_df[train_end:val_end])
+        test_dfs.append(lang_df[val_end:])
+        
+        print(f"  {lang}: {n} total → train={len(lang_df[:train_end])}, val={len(lang_df[train_end:val_end])}, test={len(lang_df[val_end:])}")
+    
+    # Combine all splits
+    train_df = pd.concat(train_dfs, ignore_index=True).sample(frac=1, random_state=random_seed).reset_index(drop=True)
+    val_df = pd.concat(val_dfs, ignore_index=True).sample(frac=1, random_state=random_seed).reset_index(drop=True) if val_dfs else pd.DataFrame()
+    test_df = pd.concat(test_dfs, ignore_index=True).sample(frac=1, random_state=random_seed).reset_index(drop=True) if test_dfs else pd.DataFrame()
+    
+    # Remove temporary column
+    train_df = train_df.drop(columns=['_language_text'])
+    if len(val_df) > 0:
+        val_df = val_df.drop(columns=['_language_text'])
+    if len(test_df) > 0:
+        test_df = test_df.drop(columns=['_language_text'])
+    
+    total = len(train_df) + len(val_df) + len(test_df)
+    print("-" * 60)
+    print(f"\nFinal dataset split:")
+    print(f"  Train: {len(train_df)} ({len(train_df)/total*100:.1f}%)")
+    print(f"  Val:   {len(val_df)} ({len(val_df)/total*100:.1f}%)")
+    print(f"  Test:  {len(test_df)} ({len(test_df)/total*100:.1f}%)")
+    
+    return train_df, val_df, test_df
+
+
 def split_dataset(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_seed=42):
     """
-    Split dataset into train/val/test sets.
+    Split dataset into train/val/test sets (simple random split).
     
     Args:
         df: DataFrame to split
@@ -121,31 +203,51 @@ def split_dataset(df, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_s
 
 def main():
     """Main function."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Prepare dataset for training')
+    parser.add_argument('--stratified', action='store_true', default=True,
+                       help='Use stratified split by language (recommended)')
+    parser.add_argument('--random', action='store_true',
+                       help='Use simple random split')
+    args = parser.parse_args()
+    
+    use_stratified = not args.random
+    
     # Paths
     data_dir = '../data'
     
-    # Find the graffiti CSV file
-    import glob
-    graffiti_files = glob.glob(os.path.join(data_dir, 'inscriptions_graffiti_*.csv'))
+    # Use the cleaned dataset (has transcription_clean column)
+    input_csv = os.path.join(data_dir, 'inscriptions_graffiti_cleaned.csv')
     
-    if not graffiti_files:
-        print("Error: No inscriptions_graffiti_*.csv file found in data directory!")
+    if not os.path.exists(input_csv):
+        print(f"Error: Cleaned dataset not found at {input_csv}")
+        print("Run clean_text.py first!")
         return
     
-    # Use the most recent file
-    input_csv = sorted(graffiti_files)[-1]
     print(f"Using input file: {input_csv}")
     
     # Prepare dataset
     output_csv = os.path.join(data_dir, 'graffiti_prepared.csv')
     df_prepared = prepare_dataset(input_csv, output_csv)
     
+    # Filter to only include rows with transcription
+    has_text = df_prepared['transcription_clean'].notna() & (df_prepared['transcription_clean'].astype(str).str.strip() != '')
+    df_with_text = df_prepared[has_text].copy()
+    print(f"\nFiltered to {len(df_with_text)} inscriptions with transcription")
+    
     # Split into train/val/test
     print("\n" + "="*60)
-    print("Splitting dataset into train/val/test...")
+    if use_stratified:
+        print("Using STRATIFIED split by language (recommended)")
+    else:
+        print("Using simple random split")
     print("="*60)
     
-    train_df, val_df, test_df = split_dataset(df_prepared, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
+    if use_stratified:
+        train_df, val_df, test_df = stratified_split_dataset(df_with_text, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
+    else:
+        train_df, val_df, test_df = split_dataset(df_with_text, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15)
     
     # Save splits
     train_df.to_csv(os.path.join(data_dir, 'train_dataset.csv'), index=False)
@@ -153,12 +255,12 @@ def main():
     test_df.to_csv(os.path.join(data_dir, 'test_dataset.csv'), index=False)
     
     print(f"\nSaved split datasets:")
-    print(f"  - {data_dir}/train_dataset.csv")
-    print(f"  - {data_dir}/val_dataset.csv")
-    print(f"  - {data_dir}/test_dataset.csv")
+    print(f"  - {data_dir}/train_dataset.csv ({len(train_df)} samples)")
+    print(f"  - {data_dir}/val_dataset.csv ({len(val_df)} samples)")
+    print(f"  - {data_dir}/test_dataset.csv ({len(test_df)} samples)")
     
     print("\n" + "="*60)
-    print("✅ Dataset preparation complete!")
+    print(" Dataset preparation complete!")
     print("="*60)
     print("\nNext step: Run crop_images.py to crop the images")
 
