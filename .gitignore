@@ -225,7 +225,7 @@ data/*
 datasets/
 processed/
 raw/
-Papar/
+Papers/
 checkpoints/
 logs/
 evaluation_results/
