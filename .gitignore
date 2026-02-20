@@ -219,10 +219,16 @@ data/
 *.temp
 *.log
 
-# Data directories
+# Data directories, results, papers, presentation and checkpoints
 .data
 data/*
 datasets/
 processed/
 raw/
-
+Papar/
+checkpoints/
+logs/
+evaluation_results/
+frontend/
+presentation/
+baselines/
