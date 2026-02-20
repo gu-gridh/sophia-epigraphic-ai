@@ -637,7 +637,8 @@ def run_cross_validation(args):
         predictions_df['_language'] = predictions_df['sample_idx'].map(idx_to_lang)
     else:
         predictions_df['_language'] = 'Unknown'
-        
+    
+    if len(predictions_df) > 0 and '_language' in predictions_df.columns:
         lang_performance = predictions_df.groupby('_language').agg({
             'cer': ['mean', 'std', 'count']
         }).round(4)
