@@ -590,23 +590,39 @@ class SophiaTransformerModel(nn.Module):
         
     def forward(
         self,
-        rti_images: Optional[torch.Tensor] = None,
+        # Compatible interface with Enhanced/MultiChannel models
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        images: Optional[torch.Tensor] = None,  # RTI images (alias for rti_images)
+        languages: Optional[torch.Tensor] = None,
+        writing_systems: Optional[torch.Tensor] = None,
         korniienko_photo: Optional[torch.Tensor] = None,
         korniienko_drawing: Optional[torch.Tensor] = None,
+        # Original transformer-specific parameters
+        rti_images: Optional[torch.Tensor] = None,
         spatial_info: Optional[Dict[str, torch.Tensor]] = None,
         text_indices: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         target_text: Optional[torch.Tensor] = None,  # For training transcription
         return_embeddings: bool = False,
         training: bool = False
-    ) -> Dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Forward pass with flexible multi-modal inputs.
         
+        Compatible with both:
+        1. Enhanced/MultiChannel interface: input_ids, attention_mask, images, languages, writing_systems
+        2. Original Transformer interface: rti_images, text_indices, text_mask, spatial_info
+        
         Args:
-            rti_images: [batch, 12, H, W] - RTI images (4 types × 3 RGB)
+            input_ids: [batch, seq_len] - target transcription (alias for text_indices)
+            attention_mask: [batch, seq_len] - padding mask (alias for text_mask)
+            images: [batch, 12, H, W] or [batch, 3, H, W] - images (alias for rti_images)
+            languages: [batch] - language IDs (unused, for compatibility)
+            writing_systems: [batch] - writing system IDs (unused, for compatibility)
             korniienko_photo: [batch, 3, H, W] - Korniienko photograph
             korniienko_drawing: [batch, 3, H, W] - Korniienko drawing
+            rti_images: [batch, 12, H, W] - RTI images (4 types × 3 RGB)
             spatial_info: dict with 'bbox' [batch, 4], 'location' [batch, 3]
             text_indices: [batch, seq_len] - existing transcription (optional)
             text_mask: [batch, seq_len] - padding mask for text
@@ -615,11 +631,28 @@ class SophiaTransformerModel(nn.Module):
             training: whether in training mode (for modality dropout)
             
         Returns:
-            outputs: dict with 'transcription_logits', 'attribution', 'embeddings' (optional)
+            transcription_logits: [batch, seq_len, vocab_size] - compatible with other models
         """
-        batch_size = (rti_images.size(0) if rti_images is not None
-                     else korniienko_photo.size(0) if korniienko_photo is not None
-                     else text_indices.size(0))
+        # Handle parameter aliases for compatibility
+        if text_indices is None and input_ids is not None:
+            text_indices = input_ids
+        if text_mask is None and attention_mask is not None:
+            text_mask = attention_mask
+        if rti_images is None and images is not None:
+            rti_images = images
+            
+        # Determine batch size from available inputs
+        batch_size = None
+        if rti_images is not None:
+            batch_size = rti_images.size(0)
+        elif korniienko_photo is not None:
+            batch_size = korniienko_photo.size(0)
+        elif korniienko_drawing is not None:
+            batch_size = korniienko_drawing.size(0)
+        elif text_indices is not None:
+            batch_size = text_indices.size(0)
+        else:
+            raise ValueError("At least one input modality must be provided")
         
         # Encode vision modalities
         vision_features, vision_mask = self.vision_encoder(
@@ -687,7 +720,9 @@ class SophiaTransformerModel(nn.Module):
         if return_embeddings:
             outputs['embeddings'] = pooled_features
         
-        return outputs
+        # Return just the logits for compatibility with other models
+        # (cross_validate.py and train.py expect a tensor, not a dict)
+        return transcription_logits
 
 
 def create_sophia_transformer(

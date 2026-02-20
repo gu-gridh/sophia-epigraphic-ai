@@ -1,301 +1,316 @@
 #!/usr/bin/env python3
 """
-Data preparation script for SOPHIA.
-Converts Saint Sophia dataset to SOPHIA training format.
+Comprehensive dataset preparation script for Saint Sophia Graffiti Recognition.
+
+This script:
+1. Fetches all inscriptions from the API
+2. Cleans transcriptions and filters invalid entries
+3. Links available images (Korniienko photos/drawings, IIIF crops)
+4. Produces a training-ready dataset
+
+Usage:
+    python scripts/prepare_dataset.py [--fetch] [--download-iiif]
+    
+Options:
+    --fetch          Fetch fresh data from API (otherwise use cached)
+    --download-iiif  Download IIIF crops for inscriptions without images
 """
 
 import os
 import sys
-import pandas as pd
+import re
 import json
 import argparse
+import requests
+import pandas as pd
 from pathlib import Path
-import shutil
-from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+from datetime import datetime
+import time
+
+# Configuration
+API_BASE = "https://saintsophia.dh.gu.se/api/inscriptions/inscription/"
+IIIF_BASE = "https://img.dh.gu.se/saintsophia/static/inscriptions/iiif/"
+DATA_DIR = Path("data")
+KORNIIENKO_DIR = DATA_DIR / "korniienkoimages"
+IIIF_DIR = DATA_DIR / "iiif_crops"
 
 
-def setup_data_directories(data_dir: str):
-    """Create necessary data directories."""
-    directories = [
-        'train', 'val', 'test',
-        'images', 'annotations',
-        'processed'
-    ]
+def fetch_inscriptions_from_api():
+    """Fetch all inscriptions from the Saint Sophia API."""
+    print("Fetching inscriptions from API...")
     
-    for directory in directories:
-        dir_path = Path(data_dir) / directory
-        dir_path.mkdir(parents=True, exist_ok=True)
-        print(f"Created directory: {dir_path}")
+    all_inscriptions = []
+    url = API_BASE
+    page = 1
+    
+    while url:
+        print(f"  Page {page}...", end=" ")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        
+        results = data.get('results', [])
+        all_inscriptions.extend(results)
+        print(f"{len(results)} inscriptions")
+        
+        url = data.get('next')
+        page += 1
+        time.sleep(0.1)  # Rate limiting
+    
+    print(f"Total: {len(all_inscriptions)} inscriptions")
+    return all_inscriptions
 
 
-def convert_saint_sophia_dataset(
-    csv_path: str,
-    annotations_dir: str,
-    images_dir: str,
-    output_dir: str,
-    test_size: float = 0.2,
-    val_size: float = 0.1
-):
-    """
-    Convert Saint Sophia dataset to SOPHIA format.
+def clean_transcription(text):
+    """Clean and normalize transcription text."""
+    if not text or pd.isna(text):
+        return ""
     
-    Args:
-        csv_path: Path to combined dataset CSV
-        annotations_dir: Directory containing annotation JSON files
-        images_dir: Directory containing inscription images
-        output_dir: Output directory for processed data
-        test_size: Fraction of data for testing
-        val_size: Fraction of data for validation
-    """
+    text = str(text).strip()
     
-    print("Loading Saint Sophia dataset.")
-    data = pd.read_csv(csv_path)
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
     
-    print(f"Loaded {len(data)} samples")
+    # Normalize whitespace
+    text = re.sub(r'\s+', ' ', text)
     
-    # Filter for complete samples (with transcription)
-    complete_data = data[
-        (data['transcription'].notna()) & 
-        (data['transcription'] != '') &
-        (data['annotation_index'] >= 0)  # Has annotation data
-    ].copy()
-    
-    print(f"Found {len(complete_data)} complete samples with transcriptions and annotations")
-    
-    # Check data availability
-    print("\nChecking data availability.")
-    available_data = []
-    
-    for idx, row in complete_data.iterrows():
-        inscription_id = row['id']
-        
-        # Check for annotation file
-        annotation_file = Path(annotations_dir) / f"annotation_{inscription_id}.json"
-        has_annotation = annotation_file.exists()
-        
-        # Check for image file
-        image_file = find_image_file(images_dir, inscription_id, row.get('panel_title', ''))
-        has_image = image_file is not None
-        
-        if has_annotation and has_image:
-            row_data = row.to_dict()
-            row_data['image_path'] = image_file
-            row_data['annotation_path'] = str(annotation_file)
-            available_data.append(row_data)
-        
-        if len(available_data) % 100 == 0:
-            print(f"Processed {len(available_data)} available samples.")
-    
-    print(f"Found {len(available_data)} samples with both images and annotations")
-    
-    if len(available_data) == 0:
-        print("No complete samples found! Check your data paths.")
+    return text.strip()
+
+
+def is_valid_transcription(text):
+    """Check if transcription is valid for training."""
+    if not text:
         return False
     
-    # Convert to DataFrame
-    available_df = pd.DataFrame(available_data)
+    # Filter out uncertain annotations (just "?" or containing "?")
+    if text == "?" or "?" in text:
+        return False
     
-    # Split data
-    print("\nSplitting dataset.")
-    
-    # First split: train+val vs test
-    train_val_df, test_df = train_test_split(
-        available_df, 
-        test_size=test_size, 
-        random_state=42,
-        stratify=available_df.get('language', None) if 'language' in available_df.columns else None
-    )
-    
-    # Second split: train vs val
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=val_size / (1 - test_size),  # Adjust for already split test set
-        random_state=42,
-        stratify=train_val_df.get('language', None) if 'language' in train_val_df.columns else None
-    )
-    
-    print(f"Train: {len(train_df)} samples")
-    print(f"Validation: {len(val_df)} samples") 
-    print(f"Test: {len(test_df)} samples")
-    
-    # Setup output directories
-    setup_data_directories(output_dir)
-    
-    # Copy images and annotations to organized structure
-    print("\nCopying data files...")
-    
-    def copy_data_files(df, split_name):
-        images_out_dir = Path(output_dir) / 'images'
-        annotations_out_dir = Path(output_dir) / 'annotations'
-        
-        for idx, row in df.iterrows():
-            inscription_id = row['id']
-            
-            # Copy image
-            src_image = row['image_path']
-            dst_image = images_out_dir / f"{inscription_id}.jpg"
-            if not dst_image.exists():
-                shutil.copy2(src_image, dst_image)
-            
-            # Copy annotation
-            src_annotation = row['annotation_path']
-            dst_annotation = annotations_out_dir / f"annotation_{inscription_id}.json"
-            if not dst_annotation.exists():
-                shutil.copy2(src_annotation, dst_annotation)
-    
-    # Copy files for each split
-    copy_data_files(train_df, 'train')
-    copy_data_files(val_df, 'val')
-    copy_data_files(test_df, 'test')
-    
-    # Save split CSVs
-    output_path = Path(output_dir)
-    train_df.to_csv(output_path / 'train_dataset.csv', index=False)
-    val_df.to_csv(output_path / 'val_dataset.csv', index=False)
-    test_df.to_csv(output_path / 'test_dataset.csv', index=False)
-    
-    # Create dataset statistics
-    stats = {
-        'total_samples': len(available_df),
-        'train_samples': len(train_df),
-        'val_samples': len(val_df),
-        'test_samples': len(test_df),
-        'unique_inscriptions': available_df['id'].nunique(),
-        'languages': available_df['language'].value_counts().to_dict() if 'language' in available_df.columns else {},
-        'average_transcription_length': available_df['transcription'].str.len().mean(),
-        'annotation_types': {}
-    }
-    
-    # Save statistics
-    with open(output_path / 'dataset_stats.json', 'w', encoding='utf-8') as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False, default=str)
-    
-    print(f"\nDataset preparation completed!")
-    print(f"Output directory: {output_dir}")
-    print(f"Dataset statistics saved to: {output_path / 'dataset_stats.json'}")
+    # Must have at least 2 characters
+    if len(text) < 2:
+        return False
     
     return True
 
 
-def find_image_file(images_dir: str, inscription_id: str, panel_title: str = '') -> str:
-    """Find image file for inscription."""
-    images_path = Path(images_dir)
+def build_korniienko_index():
+    """Build index of available Korniienko images by inscription ID."""
+    print("Indexing Korniienko images...")
     
-    # Try multiple naming conventions
-    possible_names = [
-        f"{inscription_id}.jpg",
-        f"{inscription_id}.png",
-        f"{inscription_id}.jpeg",
-        f"inscription_{inscription_id}.jpg",
-        f"inscription_{inscription_id}.png"
-    ]
+    photo_by_id = {}
+    drawing_by_id = {}
     
-    if panel_title:
-        possible_names.extend([
-            f"{panel_title}.jpg",
-            f"{panel_title}.png",
-            f"{panel_title}.jpeg"
-        ])
+    if not KORNIIENKO_DIR.exists():
+        print("  Warning: Korniienko directory not found")
+        return photo_by_id, drawing_by_id
     
-    for name in possible_names:
-        image_path = images_path / name
-        if image_path.exists():
-            return str(image_path)
+    for f in KORNIIENKO_DIR.glob("*.png"):
+        name = f.stem
+        
+        # Match pattern: ..._photo_ID or ..._drawing_ID
+        photo_match = re.search(r'_photo_(\d+)$', name)
+        drawing_match = re.search(r'_drawing_(\d+)$', name)
+        
+        if photo_match:
+            inscription_id = int(photo_match.group(1))
+            photo_by_id[inscription_id] = f"korniienkoimages/{f.name}"
+        elif drawing_match:
+            inscription_id = int(drawing_match.group(1))
+            drawing_by_id[inscription_id] = f"korniienkoimages/{f.name}"
+    
+    print(f"  Found {len(photo_by_id)} photos, {len(drawing_by_id)} drawings")
+    return photo_by_id, drawing_by_id
+
+
+def build_iiif_index():
+    """Build index of available IIIF crops by inscription ID."""
+    print("Indexing IIIF crops...")
+    
+    iiif_by_id = {}
+    
+    if not IIIF_DIR.exists():
+        print("  Warning: IIIF directory not found")
+        return iiif_by_id
+    
+    for f in IIIF_DIR.glob("*_iiif_crop.jpg"):
+        # Extract ID from filename like 3329_iiif_crop.jpg
+        match = re.match(r'(\d+)_iiif_crop\.jpg', f.name)
+        if match:
+            inscription_id = int(match.group(1))
+            iiif_by_id[inscription_id] = f"iiif_crops/{f.name}"
+    
+    print(f"  Found {len(iiif_by_id)} IIIF crops")
+    return iiif_by_id
+
+
+def parse_iiif_url(inscription_iiif_url):
+    """Parse inscription_iiif_url to extract IIIF identifier and region."""
+    if not inscription_iiif_url:
+        return None, None
+    
+    match = re.search(r'/iiif/([a-f0-9-]+\.tif)/pct:([0-9.,]+)/?', inscription_iiif_url)
+    if match:
+        iiif_id = match.group(1)
+        pct_coords = match.group(2)
+        return iiif_id, f"pct:{pct_coords}"
+    
+    return None, None
+
+
+def download_iiif_crop(inscription_id, iiif_id, region, width=800):
+    """Download a cropped inscription image from IIIF."""
+    output_path = IIIF_DIR / f"{inscription_id}_iiif_crop.jpg"
+    
+    if output_path.exists():
+        return str(output_path.relative_to(DATA_DIR))
+    
+    url = f"{IIIF_BASE}{iiif_id}/{region}/{width},/0/default.jpg"
+    
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code == 200:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'wb') as f:
+                f.write(response.content)
+            return f"iiif_crops/{output_path.name}"
+    except Exception as e:
+        pass
     
     return None
 
 
-def validate_dataset(output_dir: str):
-    """Validate the prepared dataset."""
-    print("\nValidating dataset.")
+def process_inscriptions(inscriptions, photo_index, drawing_index, iiif_index, download_iiif=False):
+    """Process inscriptions and build dataset."""
+    print("Processing inscriptions...")
     
-    output_path = Path(output_dir)
+    records = []
     
-    splits = ['train', 'val', 'test']
-    for split in splits:
-        csv_path = output_path / f'{split}_dataset.csv'
-        if not csv_path.exists():
-            print(f"ERROR: Missing {split}_dataset.csv")
+    for insc in tqdm(inscriptions, desc="Processing"):
+        inscription_id = insc.get('id')
+        
+        # Get transcription
+        transcription_raw = insc.get('transcription', '')
+        transcription_clean = clean_transcription(transcription_raw)
+        
+        # Skip invalid transcriptions
+        if not is_valid_transcription(transcription_clean):
             continue
         
-        df = pd.read_csv(csv_path)
-        print(f"{split.upper()}: {len(df)} samples")
+        # Get metadata
+        language = insc.get('language', {})
+        language_name = language.get('language_name', '') if language else ''
         
-        # Check file existence
-        missing_images = 0
-        missing_annotations = 0
+        writing_system = insc.get('writing_system', {})
+        writing_system_name = writing_system.get('writing_system_name', '') if writing_system else ''
         
-        for _, row in df.iterrows():
-            inscription_id = row['id']
-            
-            image_path = output_path / 'images' / f"{inscription_id}.jpg"
-            if not image_path.exists():
-                missing_images += 1
-            
-            annotation_path = output_path / 'annotations' / f"annotation_{inscription_id}.json"
-            if not annotation_path.exists():
-                missing_annotations += 1
+        # Get Korniienko images from index
+        korniienko_photo = photo_index.get(inscription_id, '')
+        korniienko_drawing = drawing_index.get(inscription_id, '')
         
-        if missing_images > 0:
-            print(f"  WARNING: {missing_images} missing images")
-        if missing_annotations > 0:
-            print(f"  WARNING: {missing_annotations} missing annotations")
+        # Get IIIF crop
+        iiif_crop = iiif_index.get(inscription_id, '')
         
-        if missing_images == 0 and missing_annotations == 0:
-            print(f"  All files present")
+        # Try to download IIIF crop if needed and requested
+        if download_iiif and not korniienko_photo and not korniienko_drawing and not iiif_crop:
+            iiif_url = insc.get('inscription_iiif_url', '')
+            if iiif_url:
+                iiif_id, region = parse_iiif_url(iiif_url)
+                if iiif_id and region:
+                    iiif_crop = download_iiif_crop(inscription_id, iiif_id, region)
+                    time.sleep(0.1)  # Rate limiting
+        
+        # Check if we have any image
+        has_image = bool(korniienko_photo or korniienko_drawing or iiif_crop)
+        
+        records.append({
+            'id': inscription_id,
+            'transcription_raw': transcription_raw,
+            'transcription_clean': transcription_clean,
+            'language_name': language_name,
+            'writing_system_name': writing_system_name,
+            'korniienko_photo': korniienko_photo,
+            'korniienko_drawing': korniienko_drawing,
+            'iiif_crop': iiif_crop,
+            'has_image': has_image,
+        })
     
-    print("Validation completed!")
+    return pd.DataFrame(records)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Prepare Saint Sophia dataset for SOPHIA training')
-    parser.add_argument('--csv_path', required=True, help='Path to combined dataset CSV')
-    parser.add_argument('--annotations_dir', required=True, help='Directory containing annotation JSON files')
-    parser.add_argument('--images_dir', required=True, help='Directory containing inscription images')
-    parser.add_argument('--output_dir', default='./data', help='Output directory for processed data')
-    parser.add_argument('--test_size', type=float, default=0.2, help='Fraction of data for testing')
-    parser.add_argument('--val_size', type=float, default=0.1, help='Fraction of data for validation')
-    parser.add_argument('--validate', action='store_true', help='Validate dataset after preparation')
-    
+    parser = argparse.ArgumentParser(description='Prepare Saint Sophia dataset')
+    parser.add_argument('--fetch', action='store_true', help='Fetch fresh data from API')
+    parser.add_argument('--download-iiif', action='store_true', help='Download IIIF crops')
     args = parser.parse_args()
     
-    # Check input paths
-    if not os.path.exists(args.csv_path):
-        print(f"ERROR: CSV file not found: {args.csv_path}")
-        return 1
+    print("=" * 70)
+    print("SAINT SOPHIA DATASET PREPARATION")
+    print("=" * 70)
     
-    if not os.path.exists(args.annotations_dir):
-        print(f"ERROR: Annotations directory not found: {args.annotations_dir}")
-        return 1
+    # Ensure directories exist
+    DATA_DIR.mkdir(exist_ok=True)
+    IIIF_DIR.mkdir(exist_ok=True)
     
-    if not os.path.exists(args.images_dir):
-        print(f"ERROR: Images directory not found: {args.images_dir}")
-        return 1
+    # Fetch or load inscriptions
+    cache_file = DATA_DIR / "inscriptions_cache.json"
     
-    # Convert dataset
-    success = convert_saint_sophia_dataset(
-        csv_path=args.csv_path,
-        annotations_dir=args.annotations_dir,
-        images_dir=args.images_dir,
-        output_dir=args.output_dir,
-        test_size=args.test_size,
-        val_size=args.val_size
+    if args.fetch or not cache_file.exists():
+        inscriptions = fetch_inscriptions_from_api()
+        with open(cache_file, 'w') as f:
+            json.dump(inscriptions, f)
+        print(f"Cached to {cache_file}")
+    else:
+        print(f"Loading cached data from {cache_file}")
+        with open(cache_file) as f:
+            inscriptions = json.load(f)
+        print(f"Loaded {len(inscriptions)} inscriptions")
+    
+    # Build image indices
+    photo_index, drawing_index = build_korniienko_index()
+    iiif_index = build_iiif_index()
+    
+    # Process inscriptions
+    df = process_inscriptions(
+        inscriptions, 
+        photo_index, 
+        drawing_index, 
+        iiif_index,
+        download_iiif=args.download_iiif
     )
     
-    if not success:
-        return 1
+    # Save dataset
+    output_file = DATA_DIR / "complete_dataset.csv"
+    df.to_csv(output_file, index=False)
     
-    # Validate if requested
-    if args.validate:
-        validate_dataset(args.output_dir)
+    # Statistics
+    print("\n" + "=" * 70)
+    print("DATASET STATISTICS")
+    print("=" * 70)
     
-    print("\n" + "="*50)
-    print("Data preparation completed successfully!")
-    print(f"Ready to train SOPHIA with data in: {args.output_dir}")
-    print("="*50)
+    total = len(df)
+    with_image = df['has_image'].sum()
+    with_photo = (df['korniienko_photo'] != '').sum()
+    with_drawing = (df['korniienko_drawing'] != '').sum()
+    with_iiif = (df['iiif_crop'] != '').sum()
     
-    return 0
+    print(f"Total inscriptions with valid transcription: {total}")
+    print(f"With any image: {with_image} ({100*with_image/total:.1f}%)")
+    print(f"  - Korniienko photo: {with_photo}")
+    print(f"  - Korniienko drawing: {with_drawing}")
+    print(f"  - IIIF crop: {with_iiif}")
+    print(f"\n✓ TRAINING-READY SAMPLES: {with_image}")
+    
+    # Language distribution
+    print("\nLanguage distribution:")
+    lang_counts = df[df['has_image']]['language_name'].value_counts()
+    for lang, count in lang_counts.head(10).items():
+        print(f"  {lang}: {count}")
+    
+    print(f"\nDataset saved to: {output_file}")
+    
+    return df
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()

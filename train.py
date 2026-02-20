@@ -28,7 +28,7 @@ from models.models_transformer import SophiaTransformerModel
 try:
     from transformers import XLMRobertaTokenizer
 except ImportError:
-    print("⚠️  XLM-RoBERTa tokenizer not available. Using basic character tokenizer.")
+    print(" XLM-RoBERTa tokenizer not available. Using basic character tokenizer.")
     XLMRobertaTokenizer = None
 
 # Increase PIL image size limit
@@ -207,8 +207,8 @@ class SophiaMultiModalDataset(Dataset):
         valid_indices = []
         
         for idx, row in self.df.iterrows():
-            # Check transcription
-            if pd.isna(row.get('transcription_clean')) or len(str(row.get('transcription_clean'))) < 2:
+            # Check transcription (allow single characters - valid ancient letters)
+            if pd.isna(row.get('transcription_clean')) or len(str(row.get('transcription_clean'))) < 1:
                 continue
             
             # Check RTI images if required
@@ -224,7 +224,7 @@ class SophiaMultiModalDataset(Dataset):
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
     
     def _check_rti_images(self, row):
-        """Check if RTI images exist."""
+        """Check if RTI images or IIIF crops exist."""
         # First try to use CSV columns (preferred method)
         for img_type in ['original', 'blended', 'normal', 'texture']:
             col_name = f"{img_type}_image"
@@ -235,34 +235,44 @@ class SophiaMultiModalDataset(Dataset):
         
         # Fallback: try old structure with isialy_id
         isialy_id = row.get('isialy_id', row.get('id', ''))
-        if pd.isna(isialy_id):
-            return False
+        if not pd.isna(isialy_id):
+            rti_dir = self.data_dir / 'cropped_images_hq' / self.split
+            for img_type in ['original', 'blended', 'normal', 'texture']:
+                img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
+                if img_path.exists():
+                    return True
         
-        rti_dir = self.data_dir / 'cropped_images_hq' / self.split
-        for img_type in ['original', 'blended', 'normal', 'texture']:
-            img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
-            if img_path.exists():
+        # Check IIIF crop as fallback
+        iiif_crop_path_str = row.get('iiif_crop', '')
+        if not pd.isna(iiif_crop_path_str) and str(iiif_crop_path_str).strip():
+            iiif_path = self.data_dir / str(iiif_crop_path_str)
+            if iiif_path.exists():
                 return True
+        
         return False
     
     def _check_korniienko_images(self, row):
-        """Check if Korniienko images exist."""
+        """Check if Korniienko images or IIIF crops exist."""
         # Check if CSV has Korniienko paths
         photo_path_str = row.get('korniienko_photo', '')
         drawing_path_str = row.get('korniienko_drawing', '')
-        
-        if pd.isna(photo_path_str) and pd.isna(drawing_path_str):
-            return False
+        iiif_crop_path_str = row.get('iiif_crop', '')
         
         # Check if at least one image exists
-        if not pd.isna(photo_path_str):
+        if not pd.isna(photo_path_str) and str(photo_path_str).strip():
             photo_path = self.data_dir / str(photo_path_str)
             if photo_path.exists():
                 return True
         
-        if not pd.isna(drawing_path_str):
+        if not pd.isna(drawing_path_str) and str(drawing_path_str).strip():
             drawing_path = self.data_dir / str(drawing_path_str)
             if drawing_path.exists():
+                return True
+        
+        # Check IIIF crop as fallback
+        if not pd.isna(iiif_crop_path_str) and str(iiif_crop_path_str).strip():
+            iiif_path = self.data_dir / str(iiif_crop_path_str)
+            if iiif_path.exists():
                 return True
         
         return False
@@ -289,38 +299,57 @@ class SophiaMultiModalDataset(Dataset):
         rti_images = []
         rti_types = ['original', 'blended', 'normal', 'texture']
         
+        # Check if we have IIIF crop as fallback
+        iiif_crop_path = None
+        if 'iiif_crop' in row.index and pd.notna(row['iiif_crop']) and str(row['iiif_crop']).strip():
+            potential_iiif = os.path.join(self.data_dir, str(row['iiif_crop']))
+            if os.path.exists(potential_iiif):
+                iiif_crop_path = potential_iiif
+        
         for rti_type in rti_types:
             # Try to get path from CSV column (e.g., 'original_image', 'blended_image')
             col_name = f"{rti_type}_image"
+            img_path = None
             
-            if col_name in row.index and pd.notna(row[col_name]):
+            if col_name in row.index and pd.notna(row[col_name]) and str(row[col_name]).strip():
                 # CSV has relative path, prepend data_dir
                 img_path = os.path.join(self.data_dir, str(row[col_name]))
-            else:
-                # Fallback: try old structure with isialy_id
-                img_path = os.path.join(self.rti_dir, str(isialy_id), f"{rti_type}.jpg")
+                if not os.path.exists(img_path):
+                    img_path = None
             
-            if os.path.exists(img_path):
+            if img_path is None:
+                # Fallback: try old structure with isialy_id
+                fallback_path = os.path.join(self.rti_dir, str(isialy_id), f"{rti_type}.jpg")
+                if os.path.exists(fallback_path):
+                    img_path = fallback_path
+            
+            if img_path and os.path.exists(img_path):
                 img = Image.open(img_path).convert('RGB')
                 if self.transform:
                     img = self.transform(img)
                 rti_images.append(img)
+            elif iiif_crop_path:
+                # Use IIIF crop as fallback for missing RTI images
+                img = Image.open(iiif_crop_path).convert('RGB')
+                if self.transform:
+                    img = self.transform(img)
+                rti_images.append(img)
             else:
-                # Create blank image if missing
+                # Create blank image if missing and no IIIF fallback
                 blank = torch.zeros(3, self.image_size, self.image_size)
                 rti_images.append(blank)
         
         # Stack RTI images: [4, 3, H, W] -> [12, H, W]
         rti_tensor = torch.cat(rti_images, dim=0)
         
-        # Load Korniienko PHOTO (photograph)
+        # Load Korniienko PHOTO (photograph) or IIIF crop as fallback
         korniienko_photo_tensor = None
         korniienko_photo_path = None
         
         # Try different possible column names and path formats
         possible_photo_cols = ['korniienko_photo', 'korniienko_photo_path', 'korniienko_image']
         for col in possible_photo_cols:
-            if col in row and pd.notna(row[col]):
+            if col in row and pd.notna(row[col]) and str(row[col]).strip():
                 # Could be full path or just filename
                 photo_value = str(row[col])
                 
@@ -339,6 +368,12 @@ class SophiaMultiModalDataset(Dataset):
                 
                 if korniienko_photo_path:
                     break
+        
+        # Try IIIF crop as fallback if no Korniienko photo found
+        if not korniienko_photo_path and 'iiif_crop' in row and pd.notna(row['iiif_crop']) and str(row['iiif_crop']).strip():
+            iiif_path = os.path.join(self.data_dir, str(row['iiif_crop']))
+            if os.path.exists(iiif_path):
+                korniienko_photo_path = iiif_path
         
         if korniienko_photo_path and os.path.exists(korniienko_photo_path):
             img = Image.open(korniienko_photo_path).convert('RGB')
