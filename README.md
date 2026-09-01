@@ -165,11 +165,16 @@ sophia-epigraphic-ai/
 ## Citation
 
 ```bibtex
-@inproceedings{sophia2026,
-  title={Multi-Modal Deep Learning for Medieval Graffiti Transcription},
-  author={...},
-  booktitle={ICDAR 2026},
-  year={2026}
+@InProceedings{10.1007/978-3-032-36042-7_6,
+author="Karimi, Aram
+and Westin, Jonathan
+and Almevik, Gunnar",
+title="Multi-channel Deep Learning for Medieval Inscription Recognition: A Study of Saint Sophia Cathedral Graffiti",
+booktitle="Document Analysis and Recognition -- ICDAR 2026",
+year="2027",
+publisher="Springer Nature Switzerland",
+pages="87--104",
+isbn="978-3-032-36042-7"
 }
 ```
 
