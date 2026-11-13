@@ -34,6 +34,8 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, List
 import math
 
+from .visual_tokens import FeatureTokens, build_memory
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding for transformer inputs."""
@@ -62,86 +64,46 @@ class PositionalEncoding(nn.Module):
 class MultiModalVisionEncoder(nn.Module):
     """
     Vision encoder for RTI multi-channel and Korniienko images.
-    
-    Processes:
-    - RTI images: 4 types × 3 RGB channels = 12 channels total
-    - Korniienko photo: 3 RGB channels
-    - Korniienko drawing: 3 RGB channels (or 1 grayscale)
-    
-    Uses ResNet-style architecture with attention for multi-channel fusion.
+
+    Each modality becomes a grid of visual tokens (H/16 x W/16) with 2D position and
+    modality embeddings, so the torso and decoder can attend to individual regions:
+    - RTI images: 4 types x 3 RGB = 12 channels
+    - Korniienko photo: 3 channels
+    - Korniienko drawing: 3 channels
     """
     
     def __init__(self, embed_dim: int = 512, dropout: float = 0.1):
         super().__init__()
         self.embed_dim = embed_dim
         
-        # RTI image encoder (12 channels: 4 types × 3 RGB)
+        # RTI image encoder (12 channels) -> 512 x H/16 x W/16
         self.rti_encoder = nn.Sequential(
-            # Initial conv to reduce 12 channels
             nn.Conv2d(12, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            # ResNet-style blocks
             self._make_layer(64, 128, stride=1),
             self._make_layer(128, 256, stride=2),
             self._make_layer(256, 512, stride=2),
-            
-            # Global pooling and projection
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(512, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.Dropout(dropout)
         )
         
-        # Korniienko photo encoder (3 RGB channels)
-        self.korniienko_photo_encoder = nn.Sequential(
+        # Korniienko photo / drawing encoders (3 channels) -> 256 x H/16 x W/16
+        self.korniienko_photo_encoder = self._make_korniienko_encoder()
+        self.korniienko_drawing_encoder = self._make_korniienko_encoder()
+        
+        self.rti_tokens = FeatureTokens(512, embed_dim, dropout)
+        self.photo_tokens = FeatureTokens(256, embed_dim, dropout)
+        self.drawing_tokens = FeatureTokens(256, embed_dim, dropout)
+    
+    def _make_korniienko_encoder(self):
+        return nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            self._make_layer(64, 128, stride=1),
+            self._make_layer(64, 128, stride=2),
             self._make_layer(128, 256, stride=2),
-            
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(256, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.Dropout(dropout)
         )
-        
-        # Korniienko drawing encoder (3 channels or 1 grayscale)
-        self.korniienko_drawing_encoder = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            self._make_layer(64, 128, stride=1),
-            self._make_layer(128, 256, stride=2),
-            
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(256, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.Dropout(dropout)
-        )
-        
-        # Multi-modal fusion with attention
-        self.modality_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Learned modality embeddings
-        self.rti_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.korniienko_photo_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        self.korniienko_drawing_token = nn.Parameter(torch.randn(1, 1, embed_dim))
         
     def _make_layer(self, in_channels, out_channels, stride=1):
         """Create a ResNet-style convolutional block."""
@@ -158,61 +120,27 @@ class MultiModalVisionEncoder(nn.Module):
         self,
         rti_images: Optional[torch.Tensor] = None,
         korniienko_photo: Optional[torch.Tensor] = None,
-        korniienko_drawing: Optional[torch.Tensor] = None
+        korniienko_drawing: Optional[torch.Tensor] = None,
+        modality_mask: Optional[Dict[str, torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Args:
-            rti_images: [batch, 12, H, W] - 4 RTI types concatenated
-            korniienko_photo: [batch, 3, H, W]
-            korniienko_drawing: [batch, 3, H, W]
-            
         Returns:
-            vision_features: [batch, num_modalities, embed_dim]
-            modality_mask: [batch, num_modalities] - indicates available modalities
+            vision_tokens: [batch, num_tokens, embed_dim]
+            padding_mask: [batch, num_tokens] bool, True for images missing for that sample
         """
-        batch_size = (rti_images.size(0) if rti_images is not None 
-                     else korniienko_photo.size(0) if korniienko_photo is not None
-                     else korniienko_drawing.size(0))
-        
-        vision_features = []
-        modality_mask = []
-        
-        # Encode RTI images
+        modality_mask = modality_mask or {}
+        groups = []
         if rti_images is not None:
-            rti_feat = self.rti_encoder(rti_images)  # [batch, embed_dim]
-            rti_feat = rti_feat.unsqueeze(1) + self.rti_token  # [batch, 1, embed_dim]
-            vision_features.append(rti_feat)
-            modality_mask.append(torch.ones(batch_size, 1, device=rti_images.device))
-        
-        # Encode Korniienko photo
+            groups.append((self.rti_tokens(self.rti_encoder(rti_images)), modality_mask.get('rti')))
         if korniienko_photo is not None:
-            photo_feat = self.korniienko_photo_encoder(korniienko_photo)
-            photo_feat = photo_feat.unsqueeze(1) + self.korniienko_photo_token
-            vision_features.append(photo_feat)
-            modality_mask.append(torch.ones(batch_size, 1, device=korniienko_photo.device))
-        
-        # Encode Korniienko drawing
+            groups.append((self.photo_tokens(self.korniienko_photo_encoder(korniienko_photo)),
+                           modality_mask.get('photo')))
         if korniienko_drawing is not None:
-            drawing_feat = self.korniienko_drawing_encoder(korniienko_drawing)
-            drawing_feat = drawing_feat.unsqueeze(1) + self.korniienko_drawing_token
-            vision_features.append(drawing_feat)
-            modality_mask.append(torch.ones(batch_size, 1, device=korniienko_drawing.device))
-        
-        if not vision_features:
-            # No images available - return zeros
-            return torch.zeros(batch_size, 1, self.embed_dim), torch.zeros(batch_size, 1)
-        
-        # Concatenate all available modalities
-        vision_features = torch.cat(vision_features, dim=1)  # [batch, num_modalities, embed_dim]
-        modality_mask = torch.cat(modality_mask, dim=1)  # [batch, num_modalities]
-        
-        # Apply cross-attention for modality fusion
-        fused_features, _ = self.modality_attention(
-            vision_features, vision_features, vision_features,
-            key_padding_mask=(modality_mask == 0)
-        )
-        
-        return fused_features, modality_mask
+            groups.append((self.drawing_tokens(self.korniienko_drawing_encoder(korniienko_drawing)),
+                           modality_mask.get('drawing')))
+        if not groups:
+            raise ValueError("At least one image modality must be provided")
+        return build_memory(groups)
 
 
 class SpatialEncoder(nn.Module):
@@ -453,18 +381,26 @@ class TranscriptionHead(nn.Module):
         else:
             # Training mode - embed target tokens and add positional encoding
             target_seq = self.token_embedding(target_indices)  # [batch, tgt_len, embed_dim]
-            target_seq = self.pos_encoder(target_seq)
-        
+            # PositionalEncoding expects [seq_len, batch, dim]
+            target_seq = self.pos_encoder(target_seq.transpose(0, 1)).transpose(0, 1)
+
         # Convert memory_mask to proper format (True = padding)
         if memory_mask is not None and memory_mask.dtype != torch.bool:
             memory_key_padding_mask = (memory_mask != 0)
         else:
             memory_key_padding_mask = memory_mask
-        
+
+        # Causal mask: position t may only attend to positions <= t
+        tgt_len = target_seq.size(1)
+        causal_mask = torch.triu(
+            torch.ones(tgt_len, tgt_len, dtype=torch.bool, device=target_seq.device), diagonal=1
+        )
+
         # Decode
         output = self.decoder(
             target_seq,
             memory,
+            tgt_mask=causal_mask,
             tgt_key_padding_mask=target_mask,
             memory_key_padding_mask=memory_key_padding_mask
         )
@@ -605,7 +541,8 @@ class SophiaTransformerModel(nn.Module):
         text_mask: Optional[torch.Tensor] = None,
         target_text: Optional[torch.Tensor] = None,  # For training transcription
         return_embeddings: bool = False,
-        training: bool = False
+        training: bool = False,
+        modality_mask: Optional[Dict[str, torch.Tensor]] = None
     ) -> torch.Tensor:
         """
         Forward pass with flexible multi-modal inputs.
@@ -633,39 +570,40 @@ class SophiaTransformerModel(nn.Module):
         Returns:
             transcription_logits: [batch, seq_len, vocab_size] - compatible with other models
         """
-        # Handle parameter aliases for compatibility
-        if text_indices is None and input_ids is not None:
-            text_indices = input_ids
-        if text_mask is None and attention_mask is not None:
-            text_mask = attention_mask
+        # The decoder tokens (input_ids / text_indices) are the (shifted) target sequence.
+        # They are ONLY given to the causal decoder, never to the text encoder: feeding the
+        # target transcription into the encoder memory would leak the answer.
+        decoder_ids = input_ids if input_ids is not None else text_indices
+        decoder_mask = attention_mask if attention_mask is not None else text_mask
         if rti_images is None and images is not None:
             rti_images = images
-            
-        # Determine batch size from available inputs
-        batch_size = None
-        if rti_images is not None:
-            batch_size = rti_images.size(0)
-        elif korniienko_photo is not None:
-            batch_size = korniienko_photo.size(0)
-        elif korniienko_drawing is not None:
-            batch_size = korniienko_drawing.size(0)
-        elif text_indices is not None:
-            batch_size = text_indices.size(0)
-        else:
-            raise ValueError("At least one input modality must be provided")
-        
-        # Encode vision modalities
-        vision_features, vision_mask = self.vision_encoder(
-            rti_images, korniienko_photo, korniienko_drawing
-        )  # [batch, num_vision_modalities, embed_dim]
-        
-        # Encode text (if available - for text-guided recognition)
-        text_features, text_pooled = None, None
-        if text_indices is not None:
-            text_features, text_pooled = self.text_encoder(text_indices, text_mask)
-            # Add text as another modality
+        if decoder_ids is None:
+            raise ValueError("Decoder input ids are required; use greedy_generate() for inference")
+
+        memory = self.encode(rti_images, korniienko_photo, korniienko_drawing,
+                             spatial_info=spatial_info, modality_mask=modality_mask)
+        # Return just the logits for compatibility with other models
+        return self.decode(decoder_ids, memory, attention_mask=decoder_mask)
+
+    def encode(self, images=None, korniienko_photo=None, korniienko_drawing=None,
+               spatial_info=None, context_text_indices=None, context_text_mask=None,
+               modality_mask=None, **_):
+        """
+        Encode images (+ optional spatial info and optional *context* text that is not the
+        target, e.g. a partial reading) into the torso memory. Returns (memory, padding_mask).
+        """
+        # Encode vision modalities as tokens
+        vision_features, vision_padding = self.vision_encoder(
+            images, korniienko_photo, korniienko_drawing, modality_mask
+        )  # [batch, num_tokens, embed_dim], [batch, num_tokens]
+        batch_size = vision_features.size(0)
+
+        # Encode optional context text (must never be the target transcription)
+        text_features = None
+        if context_text_indices is not None:
+            text_features, _ = self.text_encoder(context_text_indices, context_text_mask)
             text_features = text_features.mean(dim=1, keepdim=True)  # [batch, 1, embed_dim]
-        
+
         # Encode spatial information
         spatial_features = None
         if spatial_info is not None:
@@ -689,40 +627,31 @@ class SophiaTransformerModel(nn.Module):
         # Fuse modalities
         fused_features = torch.cat(modalities, dim=1)  # [batch, total_modalities, embed_dim]
         
-        # Create mask for padding
+        # Create mask for padding (True = padding)
         total_len = sum(modality_lengths)
-        fused_mask = torch.zeros(batch_size, total_len, device=fused_features.device)
+        fused_mask = torch.zeros(batch_size, total_len, dtype=torch.bool, device=fused_features.device)
         # Mark vision padding
-        fused_mask[:, :vision_features.size(1)] = (vision_mask == 0).float()
-        
+        fused_mask[:, :vision_features.size(1)] = vision_padding
+
         # Apply transformer torso for multi-modal fusion
         enriched_features = self.torso(fused_features, fused_mask)  # [batch, total_len, embed_dim]
-        
-        # Pool features for attribution (use mean pooling)
-        pooled_features = enriched_features.mean(dim=1)  # [batch, embed_dim]
-        
-        # Task-specific heads
-        outputs = {}
-        
-        # Transcription head
-        transcription_logits = self.transcription_head(
+        return enriched_features, fused_mask
+
+    def decode(self, input_ids, memory, attention_mask=None, languages=None, writing_systems=None):
+        """Causal transcription decoding over torso memory from encode()."""
+        enriched_features, fused_mask = memory
+        target_padding_mask = (attention_mask == 0) if attention_mask is not None else None
+        return self.transcription_head(
             memory=enriched_features,
             memory_mask=fused_mask,
-            target_indices=text_indices  # Pass token indices for teacher forcing during training
+            target_indices=input_ids,
+            target_mask=target_padding_mask
         )
-        outputs['transcription_logits'] = transcription_logits
-        
-        # Attribution heads
-        attribution_preds = self.attribution_head(pooled_features)
-        outputs['attribution'] = attribution_preds
-        
-        # Return embeddings for retrieval/similarity tasks
-        if return_embeddings:
-            outputs['embeddings'] = pooled_features
-        
-        # Return just the logits for compatibility with other models
-        # (cross_validate.py and train.py expect a tensor, not a dict)
-        return transcription_logits
+
+    def attribute(self, memory):
+        """Attribution heads (language / writing system / date) from torso memory."""
+        enriched_features, _ = memory
+        return self.attribution_head(enriched_features.mean(dim=1))
 
 
 def create_sophia_transformer(
@@ -793,18 +722,20 @@ if __name__ == "__main__":
         'location': torch.randn(batch_size, 3)  # (panel_id, room, elevation)
     }
     
-    outputs = model(
+    decoder_input = torch.randint(4, vocab_size, (batch_size, 20))
+    logits = model(
+        input_ids=decoder_input,
         rti_images=rti_images,
         korniienko_photo=korniienko_photo,
         spatial_info=spatial_info,
-        return_embeddings=True
     )
-    
+    memory = model.encode(rti_images, korniienko_photo, spatial_info=spatial_info)
+    attribution = model.attribute(memory)
+
     print("Model outputs:")
-    print(f"  Transcription logits: {outputs['transcription_logits'].shape}")
-    print(f"  Language logits: {outputs['attribution']['language'].shape}")
-    print(f"  Date logits: {outputs['attribution']['date'].shape}")
-    print(f"  Embeddings: {outputs['embeddings'].shape}")
+    print(f"  Transcription logits: {logits.shape}")
+    print(f"  Language logits: {attribution['language'].shape}")
+    print(f"  Date logits: {attribution['date'].shape}")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

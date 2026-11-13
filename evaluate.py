@@ -55,7 +55,17 @@ from train import (
     SophiaMultiModalDataset,
     CharacterTokenizer,
     collate_fn,
-    create_model
+    create_model,
+    build_tokenizer,
+    default_device,
+)
+from models.models_trocr import DEFAULT_TROCR, DEFAULT_VIEWS
+from decoding import (
+    ABLATION_MODES,
+    build_image_inputs,
+    language_inputs,
+    greedy_generate,
+    decode_ids
 )
 
 try:
@@ -206,79 +216,21 @@ def decode_prediction(logits, tokenizer):
     return predictions
 
 
-def generate_text_transformer(model, tokenizer, max_length=512, **kwargs):
-    """
-    Autoregressive text generation for transformer model.
-    
-    Args:
-        model: The transformer model
-        tokenizer: XLM-RoBERTa tokenizer
-        max_length: Maximum sequence length to generate
-        **kwargs: Model inputs (rti_images, korniienko_photo, etc.)
-    
-    Returns:
-        texts: List of generated text strings
-    """
-    batch_size = kwargs.get('rti_images', kwargs.get('korniienko_photo')).size(0)
-    device = kwargs.get('rti_images', kwargs.get('korniienko_photo')).device
-    
-    # Start with BOS token
-    generated_ids = torch.full((batch_size, 1), tokenizer.bos_token_id, 
-                              dtype=torch.long, device=device)
-    
-    finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-    
-    # Generate tokens one at a time
-    for step in range(max_length - 1):
-        # Pass generated tokens so far
-        outputs = model(
-            **kwargs,
-            text_indices=generated_ids,
-            text_mask=None
-        )
-        
-        logits = outputs['transcription_logits']  # [batch, seq_len, vocab]
-        
-        # Get next token (greedy)
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)  # [batch, 1]
-        
-        # Check for EOS or repetition
-        is_eos = (next_token.squeeze(-1) == tokenizer.eos_token_id)
-        finished = finished | is_eos
-        
-        # Stop if all sequences finished
-        if finished.all():
-            break
-        
-        # Check for repetition (if last 5 tokens are the same, stop)
-        if step >= 5 and generated_ids.size(1) >= 6:
-            last_5 = generated_ids[:, -5:]
-            is_repeating = (last_5 == last_5[:, :1]).all(dim=1)
-            finished = finished | is_repeating
-            
-            if finished.all():
-                break
-        
-        # Append to sequence (don't append if finished)
-        next_token = torch.where(finished.unsqueeze(-1), 
-                                torch.full_like(next_token, tokenizer.pad_token_id),
-                                next_token)
-        generated_ids = torch.cat([generated_ids, next_token], dim=1)
-    
-    # Decode to text
-    texts = []
-    for ids in generated_ids:
-        text = tokenizer.decode(ids, skip_special_tokens=True)
-        texts.append(text.strip())
-    
-    return texts
-
-
 def evaluate_model(model, dataloader, tokenizer, device, model_type,
-                   use_rti=True, use_korniienko=True):
+                   use_rti=True, use_korniienko=True,
+                   decoding='autoregressive', image_ablation='none', max_length=256,
+                   use_language=False):
     """
     Evaluate model on test set.
-    
+
+    decoding:
+        'autoregressive'         - greedy generation from the images only (the real task).
+        'teacher_forced_legacy'  - the ground-truth transcription is fed to the decoder and the
+                                   per-position argmax is scored, without a shift. This is how the
+                                   published numbers were produced; it is kept only to reproduce them
+                                   and does NOT measure recognition.
+    image_ablation: 'none' | 'zero' | 'shuffle' - sanity check of how much the images matter.
+
     Returns:
         results: dict with predictions, ground truth, and metadata
     """
@@ -291,46 +243,32 @@ def evaluate_model(model, dataloader, tokenizer, device, model_type,
     all_writing_systems = []
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            # Move to device
+        for batch in tqdm(dataloader, desc=f"Evaluating ({decoding}, images={image_ablation})"):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             languages = batch['language'].to(device)
             writing_systems = batch['writing_system'].to(device)
+            image_inputs = build_image_inputs(batch, device, use_rti, use_korniienko,
+                                              ablation=image_ablation)
+            lang_inputs = language_inputs(batch, device, use_language)
             
-            # Prepare images
-            kwargs = {}
-            if use_rti and 'rti_images' in batch:
-                kwargs['images'] = batch['rti_images'].to(device)
-            
-            if use_korniienko:
-                if batch.get('korniienko_photo') is not None:
-                    kwargs['korniienko_photo'] = batch['korniienko_photo'].to(device)
-                
-                if batch.get('korniienko_drawing') is not None:
-                    kwargs['korniienko_drawing'] = batch['korniienko_drawing'].to(device)
-            
-            # Forward pass
-            if model_type == 'transformer':
-                # Use teacher forcing for transformer (since autoregressive fails)
-                kwargs['text_indices'] = input_ids
-                kwargs['text_mask'] = attention_mask
-                if 'images' in kwargs:
-                    kwargs['rti_images'] = kwargs.pop('images')
-                outputs = model(**kwargs)
-                logits = outputs['transcription_logits']
-                # Decode predictions
-                predictions = decode_prediction(logits, tokenizer)
-            else:
+            if decoding == 'autoregressive':
+                generated = greedy_generate(
+                    model, image_inputs, tokenizer, max_length=max_length,
+                    **lang_inputs,
+                    batch_size=input_ids.size(0), device=device
+                )
+                predictions = decode_ids(generated.cpu().tolist(), tokenizer)
+            elif decoding == 'teacher_forced_legacy':
                 logits = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    languages=languages,
-                    writing_systems=writing_systems,
-                    **kwargs
+                    **lang_inputs,
+                    **image_inputs
                 )
-                # Decode predictions
                 predictions = decode_prediction(logits, tokenizer)
+            else:
+                raise ValueError(f"Unknown decoding mode: {decoding}")
             
             # Store results
             all_predictions.extend(predictions)
@@ -575,7 +513,7 @@ def main():
     
     # Model and checkpoint
     parser.add_argument('--model', type=str, required=True,
-                        choices=['multichannel', 'enhanced', 'transformer'],
+                        choices=['multichannel', 'enhanced', 'transformer', 'trocr'],
                         help='Model architecture')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
@@ -600,15 +538,24 @@ def main():
     # Evaluation parameters
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size for evaluation')
-    parser.add_argument('--image_size', type=int, default=224,
+    parser.add_argument('--image_size', type=int, nargs='+', default=None,
                         help='Input image size')
-    parser.add_argument('--max_length', type=int, default=128,
+    parser.add_argument('--max_length', type=int, default=None,
                         help='Maximum text sequence length')
     
     # Tokenizer selection
-    parser.add_argument('--tokenizer', type=str, default='xlm',
+    parser.add_argument('--tokenizer', type=str, default=None,
                         choices=['xlm', 'character'],
-                        help='Tokenizer type: xlm (XLM-RoBERTa) or character (character-level)')
+                        help='Tokenizer type (default: the one stored in the checkpoint config, '
+                             'else character)')
+    parser.add_argument('--decoding', type=str, default='autoregressive',
+                        choices=['autoregressive', 'teacher_forced_legacy'],
+                        help='autoregressive = real recognition from images; '
+                             'teacher_forced_legacy = old protocol (ground truth fed to decoder), '
+                             'only for reproducing earlier numbers')
+    parser.add_argument('--image_ablation', type=str, default='none',
+                        choices=list(ABLATION_MODES),
+                        help='Sanity check: zero out or shuffle images across the batch')
     
     # Output
     parser.add_argument('--output_dir', type=str, default=None,
@@ -618,7 +565,7 @@ def main():
     
     # Device
     parser.add_argument('--device', type=str,
-                        default='cuda' if torch.cuda.is_available() else 'cpu',
+                        default=default_device(),
                         help='Device to use')
     
     args = parser.parse_args()
@@ -651,7 +598,8 @@ def main():
             modalities.append('korniienko')
         modality_str = '+'.join(modalities) if modalities else 'none'
         
-        args.output_dir = f"evaluation_results/{args.model}_{checkpoint_name}_{modality_str}"
+        args.output_dir = (f"evaluation_results/{args.model}_{checkpoint_name}_{modality_str}"
+                           f"_{args.decoding}_img-{args.image_ablation}")
     
     # Print configuration
     print("=" * 70)
@@ -662,6 +610,10 @@ def main():
     print(f"  Modalities:")
     print(f"   RTI Images: {'✓' if args.use_rti else '✗'}")
     print(f"   Korniienko: {'✓' if args.use_korniienko else '✗'}")
+    print(f"\n Decoding: {args.decoding}")
+    print(f" Image ablation: {args.image_ablation}")
+    if args.decoding == 'teacher_forced_legacy':
+        print("   WARNING: ground truth is fed to the decoder; this does not measure recognition.")
     print(f"\n Data:")
     print(f"   Base Dir: {args.data_dir}")
     print(f"   Test CSV: {args.test_csv}")
@@ -671,7 +623,7 @@ def main():
     
     # Load checkpoint
     print("\n Loading checkpoint...")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     
     # Get config from checkpoint
     config = checkpoint.get('config', {})
@@ -679,28 +631,29 @@ def main():
     if 'val_loss' in checkpoint:
         print(f"  Validation loss: {checkpoint['val_loss']:.4f}")
     
+    # Settings that must match training: take them from the checkpoint unless overridden
+    if args.image_size is None:
+        args.image_size = config.get('image_size', 224)
+    elif len(args.image_size) == 1:
+        args.image_size = args.image_size[0]
+    else:
+        args.image_size = args.image_size[:2]
+    if args.max_length is None:
+        args.max_length = config.get('max_length', 256)
+    args.use_language = bool(config.get('use_language', False))
+    print(f" Image size: {args.image_size}, max_length: {args.max_length}, "
+          f"language conditioning: {args.use_language}")
+    
     # Initialize tokenizer
     print("\n Initializing tokenizer...")
-    if args.tokenizer == 'character':
-        tokenizer = CharacterTokenizer()
-        vocab_size = tokenizer.vocab_size
-        print(f"✓ Character-level tokenizer loaded (vocab size: {vocab_size})")
-        print(f"  ✓ Preserves all ancient Cyrillic characters (ꙗ, ꙅ, ѧ, etc.)")
-    else:  # xlm
-        if XLMRobertaTokenizer is not None:
-            try:
-                tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
-                vocab_size = tokenizer.vocab_size
-                print(f" XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
-                print(f"   Warning: May corrupt ancient Cyrillic characters")
-            except:
-                print("  XLM-RoBERTa failed, falling back to character tokenizer")
-                tokenizer = CharacterTokenizer()
-                vocab_size = tokenizer.vocab_size
-        else:
-            print("  XLM-RoBERTa not available, using character tokenizer")
-            tokenizer = CharacterTokenizer()
-            vocab_size = tokenizer.vocab_size
+    if args.tokenizer is None:
+        args.tokenizer = config.get('tokenizer', 'character')
+    args.pretrained = config.get('pretrained', DEFAULT_TROCR)
+    args.views = config.get('views', list(DEFAULT_VIEWS))
+    args.keep_aspect = bool(config.get('keep_aspect', False))
+    tokenizer = build_tokenizer(args.model, args.tokenizer, args.pretrained)
+    vocab_size = tokenizer.vocab_size if not hasattr(tokenizer, '__len__') else len(tokenizer)
+    print(f"✓ Tokenizer: {type(tokenizer).__name__} (vocab size: {vocab_size})")
     
     # Create dataset
     print("\n Loading test dataset...")
@@ -726,8 +679,16 @@ def main():
         model_type=args.model,
         image_size=args.image_size,
         augment=False,
-        split=split
+        split=split,
+        keep_aspect=args.keep_aspect
     )
+    
+    # Use the language mappings the model was trained with
+    if 'language_to_idx' in checkpoint and 'ws_to_idx' in checkpoint:
+        test_dataset.language_to_idx = checkpoint['language_to_idx']
+        test_dataset.ws_to_idx = checkpoint['ws_to_idx']
+        test_dataset.idx_to_language = {i: l for l, i in checkpoint['language_to_idx'].items()}
+        test_dataset.idx_to_ws = {i: w for w, i in checkpoint['ws_to_idx'].items()}
     
     print(f"✓ Test samples: {len(test_dataset)}")
     
@@ -769,7 +730,10 @@ def main():
         vocab_size=vocab_size,
         num_languages=num_languages,
         num_writing_systems=num_writing_systems,
-        use_korniienko=args.use_korniienko
+        use_korniienko=args.use_korniienko,
+        max_length=args.max_length,
+        pretrained=args.pretrained,
+        views=args.views
     )
     
     # Load weights
@@ -788,11 +752,23 @@ def main():
     
     results = evaluate_model(
         model, test_loader, tokenizer, args.device, args.model,
-        args.use_rti, args.use_korniienko
+        args.use_rti, args.use_korniienko,
+        decoding=args.decoding, image_ablation=args.image_ablation,
+        max_length=args.max_length, use_language=args.use_language
     )
     
     print("\n Calculating metrics...")
     metrics = calculate_metrics(results, test_dataset)
+    metrics['protocol'] = {
+        'decoding': args.decoding,
+        'image_ablation': args.image_ablation,
+        'tokenizer': args.tokenizer,
+        'use_language': args.use_language,
+        'image_size': args.image_size,
+        'max_length': args.max_length,
+        'use_rti': args.use_rti,
+        'use_korniienko': args.use_korniienko,
+    }
     
     # Print summary
     print("\n" + "=" * 70)

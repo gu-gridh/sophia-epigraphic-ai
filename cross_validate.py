@@ -25,6 +25,7 @@ Usage:
 import os
 import sys
 import argparse
+import copy
 import pandas as pd
 import numpy as np
 import torch
@@ -44,8 +45,15 @@ from train import (
     SophiaMultiModalDataset,
     CharacterTokenizer,
     collate_fn,
-    create_model
+    create_model,
+    build_tokenizer,
+    default_device,
+    load_initial_weights,
+    train_epoch,
 )
+from decoding import get_special_ids
+from models.models_trocr import DEFAULT_TROCR, DEFAULT_VIEWS
+from decoding import shift_tokens, build_image_inputs, language_inputs, greedy_generate, decode_ids
 
 
 def get_language_text(lang_str):
@@ -168,8 +176,16 @@ def decode_prediction(logits, tokenizer):
     return predictions
 
 
-def evaluate_model(model, dataloader, tokenizer, device):
-    """Evaluate model using teacher forcing (matching evaluate.py approach)."""
+def evaluate_model(model, dataloader, tokenizer, device, use_rti=True, use_korniienko=True,
+                   decoding='autoregressive', image_ablation='none', max_length=256,
+                   use_language=False):
+    """
+    Evaluate a model.
+
+    decoding='autoregressive' generates from the images only (the real task).
+    decoding='teacher_forced_legacy' feeds the ground truth to the decoder and scores the
+    unshifted argmax (the protocol behind the published numbers; it does not measure recognition).
+    """
     model.eval()
     
     all_predictions = []
@@ -178,52 +194,33 @@ def evaluate_model(model, dataloader, tokenizer, device):
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating", leave=False):
-            # Get inputs - matching evaluate.py structure
-            rti_images = batch.get('rti_images')
-            if rti_images is not None:
-                rti_images = rti_images.to(device)
-            
-            korniienko_photo = batch.get('korniienko_photo')
-            if korniienko_photo is not None:
-                korniienko_photo = korniienko_photo.to(device)
-            
-            korniienko_drawing = batch.get('korniienko_drawing')
-            if korniienko_drawing is not None:
-                korniienko_drawing = korniienko_drawing.to(device)
-            
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            
-            languages = batch.get('language')
-            if languages is not None:
-                languages = languages.to(device)
-            
-            writing_systems = batch.get('writing_system')
-            if writing_systems is not None:
-                writing_systems = writing_systems.to(device)
-            
+            lang_inputs = language_inputs(batch, device, use_language)
+            image_inputs = build_image_inputs(batch, device, use_rti, use_korniienko,
+                                              ablation=image_ablation)
             gt_transcriptions = batch.get('transcription', [])
             
-            # Forward pass with teacher forcing (same as evaluate.py)
-            try:
+            if decoding == 'autoregressive':
+                generated = greedy_generate(
+                    model, image_inputs, tokenizer, max_length=max_length,
+                    **lang_inputs,
+                    batch_size=input_ids.size(0), device=device
+                )
+                predictions = decode_ids(generated.cpu().tolist(), tokenizer)
+            elif decoding == 'teacher_forced_legacy':
                 logits = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    images=rti_images,
-                    languages=languages,
-                    writing_systems=writing_systems,
-                    korniienko_photo=korniienko_photo,
-                    korniienko_drawing=korniienko_drawing
+                    **lang_inputs,
+                    **image_inputs
                 )
-            except Exception as e:
-                print(f"Error in forward pass: {e}")
-                continue
-            
-            # Decode predictions (using argmax, same as evaluate.py)
-            predictions = decode_prediction(logits, tokenizer)
+                predictions = decode_prediction(logits, tokenizer)
+            else:
+                raise ValueError(f"Unknown decoding mode: {decoding}")
             
             # Calculate CER for each sample
-            for i, (pred, gt) in enumerate(zip(predictions, gt_transcriptions)):
+            for pred, gt in zip(predictions, gt_transcriptions):
                 all_predictions.append(pred)
                 all_targets.append(gt)
                 all_cer.append(calculate_cer(gt, pred))
@@ -243,71 +240,13 @@ def evaluate_model(model, dataloader, tokenizer, device):
         'per_sample_cer': all_cer
     }
 
-
-def train_one_epoch(model, dataloader, optimizer, criterion, tokenizer, device):
-    """Train for one epoch - matching train.py approach."""
-    model.train()
-    total_loss = 0
-    num_batches = 0
-    
-    for batch in tqdm(dataloader, desc="Training", leave=False):
-        optimizer.zero_grad()
-        
-        # Get inputs - matching train.py structure exactly
-        rti_images = batch.get('rti_images')
-        if rti_images is not None:
-            rti_images = rti_images.to(device)
-        
-        korniienko_photo = batch.get('korniienko_photo')
-        if korniienko_photo is not None:
-            korniienko_photo = korniienko_photo.to(device)
-        
-        korniienko_drawing = batch.get('korniienko_drawing')
-        if korniienko_drawing is not None:
-            korniienko_drawing = korniienko_drawing.to(device)
-        
-        # Target is input_ids - use directly without shifting (matching train.py)
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        
-        languages = batch.get('language')
-        if languages is not None:
-            languages = languages.to(device)
-        
-        writing_systems = batch.get('writing_system')
-        if writing_systems is not None:
-            writing_systems = writing_systems.to(device)
-        
-        # Forward pass - matching train.py signature exactly
-        try:
-            logits = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                images=rti_images,
-                languages=languages,
-                writing_systems=writing_systems,
-                korniienko_photo=korniienko_photo,
-                korniienko_drawing=korniienko_drawing
-            )
-        except Exception as e:
-            print(f"Error in forward pass: {e}")
-            continue
-        
-        # Calculate loss - matching train.py: logits vs input_ids directly
-        loss = criterion(
-            logits.view(-1, logits.size(-1)),
-            input_ids.view(-1)
-        )
-        
-        # Backward pass
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        total_loss += loss.item()
-        num_batches += 1
-    
-    return total_loss / max(num_batches, 1)
+def train_one_epoch(model, dataloader, optimizer, criterion, tokenizer, device,
+                    use_rti=True, use_korniienko=True, use_language=False,
+                    modality_dropout=0.0, amp=False, grad_accum=1):
+    """One epoch of next-token training (shared implementation in train.py)."""
+    return train_epoch(model, dataloader, optimizer, criterion, device, None,
+                       use_rti, use_korniienko, scheduler=None, use_language=use_language,
+                       modality_dropout=modality_dropout, amp=amp, grad_accum=grad_accum)
 
 
 def run_cross_validation(args):
@@ -317,7 +256,7 @@ def run_cross_validation(args):
     print("="*70)
     
     # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(args.device)
     print(f"\nDevice: {device}")
     
     # Load data
@@ -339,8 +278,8 @@ def run_cross_validation(args):
     print(f"Samples with transcription: {len(df)}")
     
     # Create tokenizer
-    tokenizer = CharacterTokenizer()
-    print(f"Vocabulary size: {tokenizer.vocab_size}")
+    tokenizer = build_tokenizer(args.model, 'character', args.pretrained)
+    print(f"Tokenizer: {type(tokenizer).__name__}, vocabulary size: {tokenizer.vocab_size}")
     
     # Output directory
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -348,6 +287,12 @@ def run_cross_validation(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = output_dir / "temp_splits"
     temp_dir.mkdir(exist_ok=True)
+    
+    # Language / writing-system indices from the full corpus (same for every fold)
+    languages = sorted(df['language_name'].fillna('unknown').unique()) if 'language_name' in df.columns else ['unknown']
+    writing_systems = sorted(df['writing_system_name'].fillna('unknown').unique()) if 'writing_system_name' in df.columns else ['unknown']
+    language_to_idx = {lang: i for i, lang in enumerate(languages)}
+    ws_to_idx = {ws: i for i, ws in enumerate(writing_systems)}
     
     # Create stratified folds
     print(f"\nCreating {args.folds}-fold stratified splits...")
@@ -362,193 +307,156 @@ def run_cross_validation(args):
     all_predictions = []
     
     # Run each fold
-    for fold_idx, (train_df, val_df) in enumerate(folds):
+    for fold_idx, (train_df, test_df) in enumerate(folds):
         print(f"\n{'='*70}")
         print(f"FOLD {fold_idx + 1}/{args.folds}")
         print(f"{'='*70}")
-        print(f"Train: {len(train_df)} samples, Val: {len(val_df)} samples")
         
-        # Save fold data to temporary CSV files
-        train_csv = temp_dir / f"fold{fold_idx+1}_train.csv"
-        val_csv = temp_dir / f"fold{fold_idx+1}_val.csv"
-        train_df.to_csv(train_csv, index=False)
-        val_df.to_csv(val_csv, index=False)
+        # Hold out part of the training portion (language-stratified) for choosing the best
+        # epoch, so the reported test fold is never used for model selection.
+        n_inner = max(2, int(round(1.0 / args.inner_val_frac)))
+        fit_df, select_df = create_stratified_folds(train_df, n_folds=n_inner,
+                                                    random_seed=args.seed + fold_idx)[0]
+        print(f"Train: {len(fit_df)}, model-selection: {len(select_df)}, test: {len(test_df)} samples")
         
-        # Create datasets using CSV files
+        def make_dataset(frame, name, augment, split):
+            csv_path = temp_dir / f"fold{fold_idx+1}_{name}.csv"
+            frame.to_csv(csv_path, index=False)
+            return SophiaMultiModalDataset(
+                csv_file=str(csv_path),
+                data_dir=args.data_dir,
+                tokenizer=tokenizer,
+                max_length=args.max_length,
+                use_rti=args.use_rti,
+                use_korniienko=args.use_korniienko,
+                model_type=args.model,
+                image_size=args.image_size,
+                augment=augment,
+                split=split,
+                keep_aspect=args.keep_aspect
+            )
+        
         try:
-            train_dataset = SophiaMultiModalDataset(
-                csv_file=str(train_csv),
-                data_dir=args.data_dir,
-                tokenizer=tokenizer,
-                max_length=args.max_length,
-                use_rti=args.use_rti,
-                use_korniienko=args.use_korniienko,
-                model_type=args.model,
-                augment=True,
-                split='train'
-            )
-            
-            val_dataset = SophiaMultiModalDataset(
-                csv_file=str(val_csv),
-                data_dir=args.data_dir,
-                tokenizer=tokenizer,
-                max_length=args.max_length,
-                use_rti=args.use_rti,
-                use_korniienko=args.use_korniienko,
-                model_type=args.model,
-                augment=False,
-                split='val'
-            )
+            train_dataset = make_dataset(fit_df, 'train', True, 'train')
+            select_dataset = make_dataset(select_df, 'select', False, 'val')
+            test_dataset = make_dataset(test_df, 'test', False, 'val')
         except Exception as e:
             print(f"  Error creating datasets: {e}")
             print(f"  Skipping fold {fold_idx+1}")
             continue
         
-        if len(train_dataset) == 0 or len(val_dataset) == 0:
+        if len(train_dataset) == 0 or len(select_dataset) == 0 or len(test_dataset) == 0:
             print(f"  Empty dataset, skipping fold {fold_idx+1}")
             continue
         
-        # Create dataloaders
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=args.batch_size, 
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True if device.type == 'cuda' else False
-        )
+        loader_kwargs = dict(batch_size=args.batch_size, collate_fn=collate_fn,
+                             num_workers=args.num_workers,
+                             pin_memory=device.type == 'cuda')
+        train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        select_loader = DataLoader(select_dataset, shuffle=False, **loader_kwargs)
+        test_loader = DataLoader(test_dataset, shuffle=False, **loader_kwargs)
         
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=args.batch_size, 
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True if device.type == 'cuda' else False
-        )
-        
-        # Create model
-        # Get number of languages and writing systems from datasets
-        num_languages = len(train_dataset.language_to_idx) if hasattr(train_dataset, 'language_to_idx') else 12
-        num_writing_systems = len(train_dataset.ws_to_idx) if hasattr(train_dataset, 'ws_to_idx') else 8
+        # Language indices must be consistent across the three splits: use the full-corpus mapping
+        for ds in (train_dataset, select_dataset, test_dataset):
+            ds.language_to_idx, ds.ws_to_idx = language_to_idx, ws_to_idx
         
         model = create_model(
             model_type=args.model,
             vocab_size=tokenizer.vocab_size,
-            num_languages=num_languages,
-            num_writing_systems=num_writing_systems,
-            use_korniienko=args.use_korniienko
-        ).to(device)
+            num_languages=len(language_to_idx),
+            num_writing_systems=len(ws_to_idx),
+            use_korniienko=args.use_korniienko,
+            max_length=args.max_length,
+            pretrained=args.pretrained,
+            views=args.views,
+            gradient_checkpointing=args.gradient_checkpointing
+        )
+        if args.init_from:
+            load_initial_weights(model, args.init_from)
+        model = model.to(device)
         
-        # Optimizer and loss
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-        criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.char_to_idx['<PAD>'])
-        
-        # Learning rate scheduler
+        criterion = nn.CrossEntropyLoss(ignore_index=get_special_ids(tokenizer)[2])
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         
-        # Training loop
+        eval_kwargs = dict(use_rti=args.use_rti, use_korniienko=args.use_korniienko,
+                           decoding=args.decoding, max_length=args.max_length,
+                           use_language=args.use_language)
+        
+        # Training loop: select the best epoch on the model-selection split
         best_cer = float('inf')
+        best_epoch = None
         best_model_state = None
+        epochs_without_improvement = 0
         
         for epoch in range(args.epochs):
-            # Train
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, tokenizer, device)
+            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, tokenizer, device,
+                                         args.use_rti, args.use_korniienko, args.use_language,
+                                         args.modality_dropout, args.amp, args.gradient_accumulation)
             scheduler.step()
             
-            # Evaluate
-            val_metrics = evaluate_model(model, val_loader, tokenizer, device)
-            
+            sel_metrics = evaluate_model(model, select_loader, tokenizer, device, **eval_kwargs)
             print(f"  Epoch {epoch+1}/{args.epochs}: "
                   f"loss={train_loss:.4f}, "
-                  f"CER={val_metrics['cer']:.4f}, "
-                  f"CharAcc={val_metrics['char_accuracy']:.4f}, "
-                  f"SeqAcc={val_metrics['sequence_accuracy']:.4f}")
+                  f"select CER={sel_metrics['cer']:.4f}, "
+                  f"SeqAcc={sel_metrics['sequence_accuracy']:.4f}")
             
-            # Save best model
-            if val_metrics['cer'] < best_cer:
-                best_cer = val_metrics['cer']
-                best_model_state = model.state_dict().copy()
+            if sel_metrics['cer'] < best_cer:
+                best_cer = sel_metrics['cer']
+                best_epoch = epoch + 1
+                # Deep copy: state_dict() tensors alias the live weights
+                best_model_state = copy.deepcopy(model.state_dict())
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if args.patience and epochs_without_improvement >= args.patience:
+                    print(f"  Early stopping after epoch {epoch+1} (best epoch {best_epoch})")
+                    break
         
-        # Load best model and final evaluation
+        # Load best model and evaluate ONCE on the untouched test fold
         if best_model_state is not None:
             model.load_state_dict(best_model_state)
-        final_metrics = evaluate_model(model, val_loader, tokenizer, device)
+        final_metrics = evaluate_model(model, test_loader, tokenizer, device, **eval_kwargs)
         
-        # Store results
+        # Sanity check: how much does performance depend on the images?
+        ablation_metrics = {}
+        if args.ablation_check:
+            for mode in ('zero', 'shuffle'):
+                m = evaluate_model(model, test_loader, tokenizer, device,
+                                   **{**eval_kwargs, 'image_ablation': mode})
+                ablation_metrics[f'cer_images_{mode}'] = m['cer']
+                ablation_metrics[f'sequence_accuracy_images_{mode}'] = m['sequence_accuracy']
+            print(f"  Image ablation: CER real={final_metrics['cer']:.4f}, "
+                  f"zeroed={ablation_metrics['cer_images_zero']:.4f}, "
+                  f"shuffled={ablation_metrics['cer_images_shuffle']:.4f}")
+        
         fold_result = {
             'fold': fold_idx + 1,
-            'train_size': len(train_df),
-            'val_size': len(val_df),
+            'train_size': len(train_dataset),
+            'select_size': len(select_dataset),
+            'val_size': len(test_dataset),
+            'best_epoch': best_epoch,
             'cer': final_metrics['cer'],
             'char_accuracy': final_metrics['char_accuracy'],
-            'sequence_accuracy': final_metrics['sequence_accuracy']
+            'sequence_accuracy': final_metrics['sequence_accuracy'],
+            'decoding': args.decoding,
+            **ablation_metrics
         }
         fold_results.append(fold_result)
-
-        # Build a per-sample metadata table aligned with the evaluated validation samples.
-        # This avoids incorrect global-index mappings when computing per-language results.
-        def _exists_rel(p):
-            if p is None:
-                return False
-            if isinstance(p, float) and np.isnan(p):
-                return False
-            s = str(p).strip()
-            if not s:
-                return False
-            base_dir = Path(args.data_dir)
-            return (base_dir / s).exists() or Path(s).exists()
-
-        filtered_val_df = val_df.copy()
-        if 'transcription_clean' in filtered_val_df.columns:
-            t = filtered_val_df['transcription_clean'].fillna('').astype(str)
-            mask_t = t.str.len() >= 1
-        else:
-            mask_t = np.ones(len(filtered_val_df), dtype=bool)
-
-        if args.use_korniienko:
-            photo = filtered_val_df.get('korniienko_photo', pd.Series([''] * len(filtered_val_df)))
-            draw = filtered_val_df.get('korniienko_drawing', pd.Series([''] * len(filtered_val_df)))
-            iiif = filtered_val_df.get('iiif_crop', pd.Series([''] * len(filtered_val_df)))
-            mask_img = [(_exists_rel(ph) or _exists_rel(dr) or _exists_rel(ic)) for ph, dr, ic in zip(photo, draw, iiif)]
-        elif args.use_rti:
-            # RTI / multi-modal cropped images: require all four channels.
-            o = filtered_val_df.get('original_image', pd.Series([''] * len(filtered_val_df)))
-            b = filtered_val_df.get('blended_image', pd.Series([''] * len(filtered_val_df)))
-            nrm = filtered_val_df.get('normal_image', pd.Series([''] * len(filtered_val_df)))
-            tx = filtered_val_df.get('texture_image', pd.Series([''] * len(filtered_val_df)))
-            mask_img = [(_exists_rel(p1) and _exists_rel(p2) and _exists_rel(p3) and _exists_rel(p4)) for p1, p2, p3, p4 in zip(o, b, nrm, tx)]
-        else:
-            mask_img = np.ones(len(filtered_val_df), dtype=bool)
-
-        filtered_val_df = filtered_val_df[pd.Series(mask_t) & pd.Series(mask_img)].reset_index(drop=True)
-
-        if len(filtered_val_df) != len(final_metrics.get('predictions', [])):
-            print(
-                f"  ⚠ Fold {fold_idx+1}: metadata/prediction length mismatch "
-                f"(meta={len(filtered_val_df)} vs preds={len(final_metrics.get('predictions', []))}); "
-                "per-language export may be incomplete."
-            )
         
-        # Store predictions with fold info
+        # Per-sample metadata straight from the (filtered, unshuffled) test dataset
+        meta = test_dataset.df
         for i, (pred, target, cer_val) in enumerate(zip(
             final_metrics['predictions'], 
             final_metrics['targets'],
             final_metrics['per_sample_cer']
         )):
-            sample_id = None
-            lang_name = None
-            if i < len(filtered_val_df):
-                if 'id' in filtered_val_df.columns:
-                    sample_id = filtered_val_df.iloc[i]['id']
-                if 'language_name' in filtered_val_df.columns:
-                    lang_name = filtered_val_df.iloc[i]['language_name']
-
+            row = meta.iloc[i] if i < len(meta) else {}
             all_predictions.append({
                 'fold': fold_idx + 1,
                 'sample_idx': i,
-                'id': sample_id,
-                'language_name': lang_name,
+                'id': row.get('id', None) if len(meta) else None,
+                'language_name': row.get('language_name', None) if len(meta) else None,
                 'target': target,
                 'prediction': pred,
                 'cer': cer_val
@@ -556,10 +464,19 @@ def run_cross_validation(args):
         
         # Save fold model
         if best_model_state is not None:
-            torch.save(best_model_state, output_dir / f"fold{fold_idx+1}_model.pt")
+            torch.save({
+                'model_state_dict': best_model_state,
+                'epoch': best_epoch,
+                'config': {**vars(args), 'tokenizer': 'trocr' if args.model == 'trocr' else 'character'},
+                'num_languages': len(language_to_idx),
+                'num_writing_systems': len(ws_to_idx),
+                'language_to_idx': language_to_idx,
+                'ws_to_idx': ws_to_idx,
+                'vocab_size': tokenizer.vocab_size,
+            }, output_dir / f"fold{fold_idx+1}_model.pt")
         
-        print(f"\n  Fold {fold_idx+1} Best: CER={final_metrics['cer']:.4f}, "
-              f"CharAcc={final_metrics['char_accuracy']:.4f}")
+        print(f"\n  Fold {fold_idx+1} test: CER={final_metrics['cer']:.4f}, "
+              f"SeqAcc={final_metrics['sequence_accuracy']:.4f} (best epoch {best_epoch})")
     
     # Check if we have any results
     if len(fold_results) == 0:
@@ -611,8 +528,17 @@ def run_cross_validation(args):
             'char_accuracy_std': float(np.std(char_acc_values)),
             'sequence_accuracy_mean': float(np.mean(seq_acc_values)),
             'sequence_accuracy_std': float(np.std(seq_acc_values))
-        }
+        },
+        'decoding': args.decoding,
+        'use_language': args.use_language,
+        'image_size': args.image_size,
+        'inner_val_frac': args.inner_val_frac,
     }
+    for key in ('cer_images_zero', 'cer_images_shuffle'):
+        vals = [r[key] for r in fold_results if key in r]
+        if vals:
+            results_summary['aggregate'][f'{key}_mean'] = float(np.mean(vals))
+            print(f"  {key}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
     
     with open(output_dir / "cv_results.json", 'w') as f:
         json.dump(results_summary, f, indent=2)
@@ -672,10 +598,14 @@ def main():
     
     # Model arguments
     parser.add_argument('--model', type=str, default='enhanced',
-                       choices=['multichannel', 'enhanced', 'transformer'],
+                       choices=['multichannel', 'enhanced', 'transformer', 'trocr'],
                        help='Model architecture')
-    parser.add_argument('--max_length', type=int, default=128,
-                       help='Maximum sequence length')
+    parser.add_argument('--max_length', type=int, default=256,
+                       help='Maximum token sequence length (incl. SOS/EOS)')
+    parser.add_argument('--image_size', type=int, nargs='+', default=None,
+                       help='One value (square) or HEIGHT WIDTH, e.g. 128 512')
+    parser.add_argument('--use_language', action='store_true',
+                       help='Condition the decoder on gold language labels (off by default)')
     
     # Cross-validation arguments
     parser.add_argument('--folds', type=int, default=5,
@@ -688,7 +618,21 @@ def main():
                        help='Number of epochs per fold')
     parser.add_argument('--batch_size', type=int, default=8,
                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--pretrained', type=str, default=DEFAULT_TROCR,
+                       help='TrOCR checkpoint (model=trocr)')
+    parser.add_argument('--views', type=str, default=','.join(DEFAULT_VIEWS),
+                       help='TrOCR views: original,blended,normal,texture,photo,drawing')
+    parser.add_argument('--init_from', type=str, default=None,
+                       help='Initialise every fold from this checkpoint (e.g. synthetic pretraining)')
+    parser.add_argument('--modality_dropout', type=float, default=0.0,
+                       help='Training: hide each available modality with this probability')
+    parser.add_argument('--keep_aspect', action='store_true',
+                       help='Letterbox images instead of stretching them')
+    parser.add_argument('--amp', action='store_true', help='bf16 mixed precision on CUDA')
+    parser.add_argument('--gradient_checkpointing', action='store_true')
+    parser.add_argument('--gradient_accumulation', type=int, default=1)
+    parser.add_argument('--device', type=str, default=default_device())
+    parser.add_argument('--lr', type=float, default=None,
                        help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=4,
                        help='Number of data loading workers')
@@ -705,11 +649,29 @@ def main():
     parser.add_argument('--output_dir', type=str, default='evaluation_results',
                        help='Output directory for results')
     
+    # Evaluation protocol
+    parser.add_argument('--decoding', type=str, default='autoregressive',
+                       choices=['autoregressive', 'teacher_forced_legacy'],
+                       help='autoregressive = real recognition from images; '
+                            'teacher_forced_legacy = old protocol, only to reproduce earlier numbers')
+    parser.add_argument('--inner_val_frac', type=float, default=0.1,
+                       help='Share of each training portion held out to choose the best epoch')
+    parser.add_argument('--patience', type=int, default=0,
+                       help='Early stopping patience in epochs on the selection split (0 = off)')
+    parser.add_argument('--ablation_check', action='store_true',
+                       help='Also evaluate each fold with zeroed and shuffled images')
+    
     # Quick mode
     parser.add_argument('--quick', action='store_true',
                        help='Quick validation mode (fewer epochs)')
     
     args = parser.parse_args()
+    if args.image_size is None:
+        args.image_size = [384] if args.model == 'trocr' else [224]
+    args.image_size = args.image_size[0] if len(args.image_size) == 1 else args.image_size[:2]
+    if args.lr is None:
+        args.lr = 3e-5 if args.model == 'trocr' else 1e-4
+    args.views = [v.strip() for v in args.views.split(',') if v.strip()]
     
     # Handle modality flags
     if args.no_korniienko:

@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 import warnings
 import os
+import html
+import unicodedata
 
 warnings.filterwarnings('ignore')
 
@@ -23,6 +25,9 @@ warnings.filterwarnings('ignore')
 from models.models_multichannel import MultiChannelModel
 from models.models_enhanced import EnhancedModel
 from models.models_transformer import SophiaTransformerModel
+from models.models_trocr import SophiaTrOCRModel, TrOCRTokenizerWrapper, DEFAULT_TROCR, DEFAULT_VIEWS
+from decoding import (shift_tokens, build_image_inputs, language_inputs, get_special_ids,
+                      apply_modality_dropout)
 
 # For tokenization
 try:
@@ -35,8 +40,21 @@ except ImportError:
 Image.MAX_IMAGE_PIXELS = None
 
 
+def clean_transcription(text):
+    """Decode HTML entities (e.g. '&kappa;', '&middot;', also double-escaped) and NFC-normalise."""
+    if text is None or (isinstance(text, float) and np.isnan(text)):
+        return ''
+    text = str(text)
+    for _ in range(3):  # handle '&amp;kappa;' style double escaping
+        unescaped = html.unescape(text)
+        if unescaped == text:
+            break
+        text = unescaped
+    return unicodedata.normalize('NFC', text).strip()
+
+
 class CharacterTokenizer:
-    """Simple character-level tokenizer as fallback."""
+    """Character-level tokenizer for the multi-script Saint Sophia corpus."""
     
     def __init__(self, vocab_file=None):
         # Create character vocabulary
@@ -44,27 +62,43 @@ class CharacterTokenizer:
             '<PAD>': 0, '<SOS>': 1, '<EOS>': 2, '<UNK>': 3,
         }
         
-        # Add common characters (Greek, Latin, Cyrillic, numbers, punctuation)
+        # Original hand-picked characters (kept first so their order is stable)
         chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        # Greek (including extended)
         chars += "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψωϫ"
-        # Standard Cyrillic
         chars += "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-        # Ancient/Extended Cyrillic (CRITICAL for Saint Sophia!)
-        chars += "ЄІєіѕѣѥѦѧѩѫѯѰѱѲѵѿ҂"  # iotified letters, yus, fita, izhitsa, etc.
-        chars += "ꙀꙁꙂꙃꙄꙅꙆꙇꙈꙉꙊꙋꙌꙍꙎꙏꙐꙑꙒꙓꙔꙕꙖꙗꙘꙙꙚꙛꙜꙝꙞꙟꙠꙡꙢꙣ"  # Extended Cyrillic Supplement
-        # Armenian
+        chars += "ЄІєіѕѣѥѦѧѩѫѯѰѱѲѵѿ҂"
+        chars += "ꙀꙁꙂꙃꙄꙅꙆꙇꙈꙉꙊꙋꙌꙍꙎꙏꙐꙑꙒꙓꙔꙕꙖꙗꙘꙙꙚꙛꙜꙝꙞꙟꙠꙡꙢꙣ"
         chars += "ԱԲԳԴԵԶԷԸԹԺԻԼԽԾԿՀՁՂՃՄՅՆՇՈՉՊՋՌՍՎՏՐՑՒՓՔՕՖաբգդեզէըթժիլխծկհձղճմյնշոչպջռսվտրցւփքօֆ"
-        # Numbers and punctuation
-        chars += "0123456789०१२३४५६७८९୳၊"  # Latin + Devanagari + Oriya + Myanmar
+        chars += "0123456789०१२३४५६७८९୳၊"
         chars += ".,;:!?-–—'\"()[]{}/@#$%&*+=<>|\\~`_"
-        # Special symbols
-        chars += "✠ⰰⰱⰲⰳⰴⰵⰶⰷⰸⰹⰺⰻⰼⰽⰾⰿⱀⱁⱂⱃⱄⱅⱆⱇⱈⱉⱊⱋⱌⱍⱎⱏⱐⱑⱒⱓⱔⱕⱖⱗⱘⱙⱚⱛⱜⱝⱞ"  # Glagolitic + Cross
-        # Whitespace
+        chars += "✠ⰰⰱⰲⰳⰴⰵⰶⰷⰸⰹⰺⰻⰼⰽⰾⰿⱀⱁⱂⱃⱄⱅⱆⱇⱈⱉⱊⱋⱌⱍⱎⱏⱐⱑⱒⱓⱔⱕⱖⱗⱘⱙⱚⱛⱜⱝⱞ"
         chars += " \n\t"
         
-        for idx, char in enumerate(chars, start=4):
-            self.char_to_idx[char] = idx
+        # Full Unicode blocks for the scripts in the corpus, so that e.g. lowercase fita,
+        # omega, big yus, Polish diacritics and combining titlo are not mapped to <UNK>.
+        ranges = [
+            (0x00A0, 0x017F),  # Latin-1 Supplement + Latin Extended-A (Polish, German, ...)
+            (0x0300, 0x036F),  # Combining diacritical marks
+            (0x0370, 0x03FF),  # Greek and Coptic
+            (0x0400, 0x052F),  # Cyrillic + Cyrillic Supplement (incl. titlo U+0483)
+            (0x0531, 0x058F),  # Armenian
+            (0x1C80, 0x1C8F),  # Cyrillic Extended-C
+            (0x1F00, 0x1FFF),  # Greek Extended (polytonic)
+            (0x2010, 0x205E),  # General punctuation
+            (0x2C00, 0x2C5F),  # Glagolitic
+            (0x2DE0, 0x2DFF),  # Cyrillic Extended-A (combining superscript letters)
+            (0xA640, 0xA69F),  # Cyrillic Extended-B
+        ]
+        for lo, hi in ranges:
+            chars += ''.join(chr(c) for c in range(lo, hi + 1)
+                             if unicodedata.category(chr(c)) not in ('Cn', 'Cc', 'Cs', 'Co'))
+        # Private Use Area: the transcriptions use PUA code points from the project's own
+        # epigraphic font (~10% of lines). Keep them learnable instead of mapping to <UNK>.
+        chars += ''.join(chr(c) for c in range(0xE000, 0xE100))
+        
+        for char in chars:
+            if char not in self.char_to_idx:
+                self.char_to_idx[char] = len(self.char_to_idx)
         
         self.idx_to_char = {idx: char for char, idx in self.char_to_idx.items()}
         self.vocab_size = len(self.char_to_idx)
@@ -80,29 +114,30 @@ class CharacterTokenizer:
     
     def _encode_single(self, text, max_length, padding, truncation):
         """Encode single text."""
-        # Add SOS and EOS tokens
         indices = [self.char_to_idx['<SOS>']]
-        
         for char in text:
             indices.append(self.char_to_idx.get(char, self.char_to_idx['<UNK>']))
-        
         indices.append(self.char_to_idx['<EOS>'])
         
-        # Truncate if needed
         if truncation and len(indices) > max_length:
             indices = indices[:max_length-1] + [self.char_to_idx['<EOS>']]
-        
-        # Pad if needed
         if padding and len(indices) < max_length:
             indices += [self.char_to_idx['<PAD>']] * (max_length - len(indices))
-        
         return indices
     
     def _create_mask(self, text, max_length):
         """Create attention mask."""
         length = min(len(text) + 2, max_length)  # +2 for SOS and EOS
-        mask = [1] * length + [0] * (max_length - length)
-        return mask
+        return [1] * length + [0] * (max_length - length)
+    
+    def unknown_chars(self, texts):
+        """Characters in `texts` that are not in the vocabulary, with counts."""
+        counts = {}
+        for t in texts:
+            for ch in t:
+                if ch not in self.char_to_idx:
+                    counts[ch] = counts.get(ch, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
     
     def decode(self, indices):
         """Decode indices back to text."""
@@ -114,87 +149,137 @@ class CharacterTokenizer:
         return ''.join(chars)
 
 
+class LetterboxResize:
+    """Resize keeping the aspect ratio, then pad to (height, width) with neutral grey."""
+
+    def __init__(self, size, fill=(128, 128, 128)):
+        self.size, self.fill = size, fill
+
+    def __call__(self, img):
+        th, tw = self.size
+        w, h = img.size
+        scale = min(tw / w, th / h)
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        img = img.resize((nw, nh), Image.BILINEAR)
+        canvas = Image.new('RGB', (tw, th), self.fill)
+        canvas.paste(img, ((tw - nw) // 2, (th - nh) // 2))
+        return canvas
+
+
+def default_device():
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def build_tokenizer(model_type, tokenizer_name='character', pretrained=DEFAULT_TROCR):
+    """Tokenizer matching the model: TrOCR's own BPE for 'trocr', else character-level."""
+    if model_type == 'trocr':
+        return TrOCRTokenizerWrapper(pretrained)
+    if tokenizer_name == 'xlm' and XLMRobertaTokenizer is not None:
+        return XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
+    return CharacterTokenizer()
+
+
+RTI_TYPES = ['original', 'blended', 'normal', 'texture']
+# Photometric augmentation only makes sense for photographic layers; normal maps encode
+# surface orientation in their colours and must not be colour-jittered.
+PHOTOMETRIC_RTI_TYPES = {'original', 'blended'}
+
+
 class SophiaMultiModalDataset(Dataset):
     """
     Multi-modal dataset for Saint Sophia graffiti recognition.
     
-    Supports flexible data loading:
-    - RTI images (12 channels: 4 types × 3 RGB)
-    - Korniienko photo (3 RGB channels)
-    - Korniienko drawing (3 RGB channels)
-    - Language and writing system labels
-    
-    Gracefully handles missing modalities.
+    Returns per sample: 12-channel RTI tensor, Korniienko photo and drawing, tokenized
+    transcription, language / writing-system indices, and presence flags telling the model
+    which images really exist for this sample (missing ones are masked, not read as black images).
     """
     
-    def __init__(self, csv_file, data_dir, tokenizer, max_length=128,
+    def __init__(self, csv_file, data_dir, tokenizer, max_length=256,
                  use_rti=True, use_korniienko=True, model_type='enhanced',
-                 image_size=224, augment=False, split='train'):
+                 image_size=224, augment=False, split='train', keep_aspect=False):
         """
         Args:
             csv_file: Path to comprehensive dataset CSV
             data_dir: Base directory containing all data
             tokenizer: Text tokenizer
-            max_length: Maximum text sequence length
+            max_length: Maximum token sequence length (incl. SOS/EOS)
             use_rti: Whether to load RTI images
             use_korniienko: Whether to load Korniienko images
             model_type: 'multichannel', 'enhanced', or 'transformer'
-            image_size: Target image size
+            image_size: int (square) or (height, width)
             augment: Whether to apply data augmentation
             split: Dataset split ('train', 'val', or 'test')
+            keep_aspect: letterbox instead of stretching images to image_size
         """
         self.df = pd.read_csv(csv_file)
+        self.keep_aspect = keep_aspect
         self.data_dir = Path(data_dir)
-        self.rti_dir = self.data_dir  # RTI images paths are relative to data/ directory
-        self.korniienko_dir = self.data_dir  # Korniienko images are in data/ directory
+        self.rti_dir = self.data_dir
+        self.korniienko_dir = self.data_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.use_rti = use_rti
         self.use_korniienko = use_korniienko
         self.model_type = model_type
-        self.image_size = image_size
+        self.image_hw = (image_size, image_size) if isinstance(image_size, int) else tuple(image_size)
+        self.augment = augment
         self.split = split
         
-        # Define transforms
-        self.transform = self._create_transforms(augment)
+        # Clean transcriptions once (HTML entities, Unicode normalisation)
+        if 'transcription_clean' in self.df.columns:
+            self.df['transcription_clean'] = self.df['transcription_clean'].apply(clean_transcription)
         
-        # Create mappings
+        self._create_transforms(augment)
         self._create_mappings()
-        
-        # Filter valid samples
         self._filter_valid_samples()
         
         print(f"✓ Dataset loaded: {len(self.df)} samples")
         print(f"  RTI: {'✓' if use_rti else '✗'}, Korniienko: {'✓' if use_korniienko else '✗'}")
+        self._report_text_coverage()
+    
+    def _report_text_coverage(self):
+        texts = self.df['transcription_clean'].astype(str).tolist() if len(self.df) else []
+        if hasattr(self.tokenizer, 'unknown_chars') and texts:
+            unk = self.tokenizer.unknown_chars(texts)
+            if unk:
+                total = sum(len(t) for t in texts)
+                shown = ' '.join(f"{c!r}×{n}" for c, n in list(unk.items())[:15])
+                print(f"  ⚠ {sum(unk.values())} of {total} characters are not in the vocabulary "
+                      f"({len(unk)} distinct): {shown}")
+        length = getattr(self.tokenizer, 'token_length', lambda t: len(t) + 2)
+        too_long = sum(length(t) > self.max_length for t in texts)
+        if too_long:
+            print(f"  ⚠ {too_long} transcriptions are longer than max_length={self.max_length} and will be truncated")
         
     def _create_transforms(self, augment):
-        """Create image transformations."""
+        """Resize/ToTensor per image; augmentations are applied in __getitem__."""
+        resize = LetterboxResize(self.image_hw) if self.keep_aspect else transforms.Resize(self.image_hw)
+        self.base_transform = transforms.Compose([resize, transforms.ToTensor()])
         if augment:
-            return transforms.Compose([
-                transforms.Resize((self.image_size, self.image_size)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(10),
-                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # Add translation
-                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # Add blur
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5], std=[0.5])
+            # Photometric: per image (and never on normal maps)
+            self.photometric = transforms.Compose([
+                transforms.ColorJitter(brightness=0.3, contrast=0.3),
+                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.5))], p=0.3),
             ])
+            # Geometric: one random draw applied to all 12 RTI channels together so the
+            # layers stay pixel-aligned. No horizontal flip: mirrored letters are different letters.
+            self.geometric = transforms.RandomAffine(
+                degrees=5, translate=(0.05, 0.05), scale=(0.9, 1.1), shear=5
+            )
         else:
-            return transforms.Compose([
-                transforms.Resize((self.image_size, self.image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5], std=[0.5])
-            ])
+            self.photometric = None
+            self.geometric = None
     
     def _create_mappings(self):
         """Create language and writing system mappings."""
-        # Language mapping
         languages = self.df['language_name'].fillna('unknown').unique()
         self.language_to_idx = {lang: idx for idx, lang in enumerate(sorted(languages))}
         self.idx_to_language = {idx: lang for lang, idx in self.language_to_idx.items()}
         
-        # Writing system mapping
         writing_systems = self.df['writing_system_name'].fillna('unknown').unique()
         self.ws_to_idx = {ws: idx for idx, ws in enumerate(sorted(writing_systems))}
         self.idx_to_ws = {idx: ws for ws, idx in self.ws_to_idx.items()}
@@ -205,77 +290,65 @@ class SophiaMultiModalDataset(Dataset):
     def _filter_valid_samples(self):
         """Filter for samples with valid transcriptions and available images."""
         valid_indices = []
-        
         for idx, row in self.df.iterrows():
-            # Check transcription (allow single characters - valid ancient letters)
-            if pd.isna(row.get('transcription_clean')) or len(str(row.get('transcription_clean'))) < 1:
+            if len(str(row.get('transcription_clean', ''))) < 1:
                 continue
-            
-            # Check RTI images if required
             if self.use_rti and not self._check_rti_images(row):
                 continue
-            
-            # Check Korniienko images if required
             if self.use_korniienko and not self._check_korniienko_images(row):
                 continue
-            
             valid_indices.append(idx)
-        
         self.df = self.df.iloc[valid_indices].reset_index(drop=True)
     
     def _check_rti_images(self, row):
         """Check if RTI images or IIIF crops exist."""
-        # First try to use CSV columns (preferred method)
-        for img_type in ['original', 'blended', 'normal', 'texture']:
+        for img_type in RTI_TYPES:
             col_name = f"{img_type}_image"
             if col_name in row.index and pd.notna(row[col_name]):
-                img_path = self.data_dir / str(row[col_name])
-                if img_path.exists():
+                if (self.data_dir / str(row[col_name])).exists():
                     return True
         
-        # Fallback: try old structure with isialy_id
         isialy_id = row.get('isialy_id', row.get('id', ''))
         if not pd.isna(isialy_id):
             rti_dir = self.data_dir / 'cropped_images_hq' / self.split
-            for img_type in ['original', 'blended', 'normal', 'texture']:
-                img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
-                if img_path.exists():
+            for img_type in RTI_TYPES:
+                if (rti_dir / img_type / f"{isialy_id}_{img_type}.png").exists():
                     return True
         
-        # Check IIIF crop as fallback
-        iiif_crop_path_str = row.get('iiif_crop', '')
-        if not pd.isna(iiif_crop_path_str) and str(iiif_crop_path_str).strip():
-            iiif_path = self.data_dir / str(iiif_crop_path_str)
-            if iiif_path.exists():
-                return True
-        
-        return False
+        return self._iiif_path(row) is not None
     
     def _check_korniienko_images(self, row):
         """Check if Korniienko images or IIIF crops exist."""
-        # Check if CSV has Korniienko paths
-        photo_path_str = row.get('korniienko_photo', '')
-        drawing_path_str = row.get('korniienko_drawing', '')
-        iiif_crop_path_str = row.get('iiif_crop', '')
-        
-        # Check if at least one image exists
-        if not pd.isna(photo_path_str) and str(photo_path_str).strip():
-            photo_path = self.data_dir / str(photo_path_str)
-            if photo_path.exists():
+        for col in ('korniienko_photo', 'korniienko_drawing'):
+            value = row.get(col, '')
+            if not pd.isna(value) and str(value).strip() and (self.data_dir / str(value)).exists():
                 return True
-        
-        if not pd.isna(drawing_path_str) and str(drawing_path_str).strip():
-            drawing_path = self.data_dir / str(drawing_path_str)
-            if drawing_path.exists():
-                return True
-        
-        # Check IIIF crop as fallback
-        if not pd.isna(iiif_crop_path_str) and str(iiif_crop_path_str).strip():
-            iiif_path = self.data_dir / str(iiif_crop_path_str)
-            if iiif_path.exists():
-                return True
-        
-        return False
+        return self._iiif_path(row) is not None
+    
+    def _iiif_path(self, row):
+        value = row.get('iiif_crop', '')
+        if not pd.isna(value) and str(value).strip():
+            path = os.path.join(self.data_dir, str(value))
+            if os.path.exists(path):
+                return path
+        return None
+    
+    def _resolve(self, candidates):
+        for path in candidates:
+            if path and os.path.exists(path):
+                return path
+        return None
+    
+    def _load_image(self, path, photometric=True):
+        """Load -> resize -> [0,1] tensor (+ per-image photometric augmentation)."""
+        img = self.base_transform(Image.open(path).convert('RGB'))
+        if self.photometric is not None and photometric:
+            img = self.photometric(img)
+        return img
+    
+    @staticmethod
+    def _normalize(t):
+        return (t - 0.5) / 0.5
     
     def __len__(self):
         return len(self.df)
@@ -283,11 +356,9 @@ class SophiaMultiModalDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         isialy_id = row.get('isialy_id', row.get('id', ''))
+        h, w = self.image_hw
         
-        # Load transcription
         transcription = str(row.get('transcription_clean', ''))
-        
-        # Tokenize
         encoded = self.tokenizer(
             transcription,
             max_length=self.max_length,
@@ -295,133 +366,81 @@ class SophiaMultiModalDataset(Dataset):
             truncation=True
         )
         
-        # Load RTI images (4 types × 3 RGB = 12 channels)
-        rti_images = []
-        rti_types = ['original', 'blended', 'normal', 'texture']
+        iiif_crop_path = self._iiif_path(row)
         
-        # Check if we have IIIF crop as fallback
-        iiif_crop_path = None
-        if 'iiif_crop' in row.index and pd.notna(row['iiif_crop']) and str(row['iiif_crop']).strip():
-            potential_iiif = os.path.join(self.data_dir, str(row['iiif_crop']))
-            if os.path.exists(potential_iiif):
-                iiif_crop_path = potential_iiif
-        
-        for rti_type in rti_types:
-            # Try to get path from CSV column (e.g., 'original_image', 'blended_image')
-            col_name = f"{rti_type}_image"
-            img_path = None
-            
-            if col_name in row.index and pd.notna(row[col_name]) and str(row[col_name]).strip():
-                # CSV has relative path, prepend data_dir
-                img_path = os.path.join(self.data_dir, str(row[col_name]))
-                if not os.path.exists(img_path):
-                    img_path = None
-            
-            if img_path is None:
-                # Fallback: try old structure with isialy_id
-                fallback_path = os.path.join(self.rti_dir, str(isialy_id), f"{rti_type}.jpg")
-                if os.path.exists(fallback_path):
-                    img_path = fallback_path
-            
-            if img_path and os.path.exists(img_path):
-                img = Image.open(img_path).convert('RGB')
-                if self.transform:
-                    img = self.transform(img)
-                rti_images.append(img)
-            elif iiif_crop_path:
-                # Use IIIF crop as fallback for missing RTI images
-                img = Image.open(iiif_crop_path).convert('RGB')
-                if self.transform:
-                    img = self.transform(img)
-                rti_images.append(img)
-            else:
-                # Create blank image if missing and no IIIF fallback
-                blank = torch.zeros(3, self.image_size, self.image_size)
-                rti_images.append(blank)
-        
-        # Stack RTI images: [4, 3, H, W] -> [12, H, W]
-        rti_tensor = torch.cat(rti_images, dim=0)
-        
-        # Load Korniienko PHOTO (photograph) or IIIF crop as fallback
-        korniienko_photo_tensor = None
-        korniienko_photo_path = None
-        
-        # Try different possible column names and path formats
-        possible_photo_cols = ['korniienko_photo', 'korniienko_photo_path', 'korniienko_image']
-        for col in possible_photo_cols:
-            if col in row and pd.notna(row[col]) and str(row[col]).strip():
-                # Could be full path or just filename
-                photo_value = str(row[col])
-                
-                # Try different path constructions
-                possible_paths = [
-                    photo_value,  # Full path from CSV
-                    os.path.join(self.korniienko_dir, photo_value),  # korniienko_images/filename
-                    os.path.join(self.korniienko_dir, f"{isialy_id}_photo.jpg"),  # Standard naming
-                    os.path.join(self.korniienko_dir, f"{isialy_id}.jpg"),  # Simple naming
-                ]
-                
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        korniienko_photo_path = path
-                        break
-                
-                if korniienko_photo_path:
-                    break
-        
-        # Try IIIF crop as fallback if no Korniienko photo found
-        if not korniienko_photo_path and 'iiif_crop' in row and pd.notna(row['iiif_crop']) and str(row['iiif_crop']).strip():
-            iiif_path = os.path.join(self.data_dir, str(row['iiif_crop']))
-            if os.path.exists(iiif_path):
-                korniienko_photo_path = iiif_path
-        
-        if korniienko_photo_path and os.path.exists(korniienko_photo_path):
-            img = Image.open(korniienko_photo_path).convert('RGB')
-            if self.transform:
-                img = self.transform(img)
-            korniienko_photo_tensor = img
+        # ---- RTI: 4 layers x 3 RGB = 12 channels ---------------------------------
+        layers, layer_present = [], []
+        if self.use_rti:
+            for rti_type in RTI_TYPES:
+                col_name = f"{rti_type}_image"
+                path = None
+                if col_name in row.index and pd.notna(row[col_name]) and str(row[col_name]).strip():
+                    path = self._resolve([os.path.join(self.data_dir, str(row[col_name]))])
+                if path is None:
+                    path = self._resolve([os.path.join(self.rti_dir, str(isialy_id), f"{rti_type}.jpg")])
+                layers.append(self._load_image(path, rti_type in PHOTOMETRIC_RTI_TYPES) if path else None)
+                layer_present.append(path is not None)
+            # No RTI at all: use the IIIF crop as the 'original' layer only (not copied into
+            # all four layers, which would pretend we have blended/normal/texture data).
+            if not any(layer_present) and iiif_crop_path:
+                layers[0] = self._load_image(iiif_crop_path, True)
+                layer_present[0] = True
         else:
-            # Create blank if missing
-            korniienko_photo_tensor = torch.zeros(3, self.image_size, self.image_size)
+            layers, layer_present = [None] * 4, [False] * 4
         
-        # Load Korniienko DRAWING (tracing/drawing)
-        korniienko_drawing_tensor = None
-        korniienko_drawing_path = None
+        rti_tensor = torch.cat([l if l is not None else torch.zeros(3, h, w) for l in layers], dim=0)
+        if self.geometric is not None and any(layer_present):
+            rti_tensor = self.geometric(rti_tensor)  # one draw for all 12 channels
+        rti_tensor = self._normalize(rti_tensor)
+        for i, present in enumerate(layer_present):
+            if not present:
+                rti_tensor[3 * i:3 * i + 3] = 0.0
+        rti_present = any(layer_present)
         
-        possible_drawing_cols = ['korniienko_drawing', 'korniienko_drawing_path']
-        for col in possible_drawing_cols:
-            if col in row and pd.notna(row[col]):
-                drawing_value = str(row[col])
-                
-                possible_paths = [
-                    drawing_value,
-                    os.path.join(self.korniienko_dir, drawing_value),
-                    os.path.join(self.korniienko_dir, f"{isialy_id}_drawing.jpg"),
-                    os.path.join(self.korniienko_dir, f"{isialy_id}_tracing.jpg"),
-                ]
-                
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        korniienko_drawing_path = path
+        # ---- Korniienko photo / drawing ------------------------------------------
+        photo_path = drawing_path = None
+        if self.use_korniienko:
+            for col in ['korniienko_photo', 'korniienko_photo_path', 'korniienko_image']:
+                if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                    value = str(row[col])
+                    photo_path = self._resolve([
+                        value,
+                        os.path.join(self.korniienko_dir, value),
+                        os.path.join(self.korniienko_dir, f"{isialy_id}_photo.jpg"),
+                        os.path.join(self.korniienko_dir, f"{isialy_id}.jpg"),
+                    ])
+                    if photo_path:
                         break
-                
-                if korniienko_drawing_path:
-                    break
+            for col in ['korniienko_drawing', 'korniienko_drawing_path']:
+                if col in row and pd.notna(row[col]) and str(row[col]).strip():
+                    value = str(row[col])
+                    drawing_path = self._resolve([
+                        value,
+                        os.path.join(self.korniienko_dir, value),
+                        os.path.join(self.korniienko_dir, f"{isialy_id}_drawing.jpg"),
+                        os.path.join(self.korniienko_dir, f"{isialy_id}_tracing.jpg"),
+                    ])
+                    if drawing_path:
+                        break
+            # IIIF crop as photo fallback only if it is not already used as the RTI layer
+            if photo_path is None and iiif_crop_path and not (self.use_rti and rti_present):
+                photo_path = iiif_crop_path
         
-        if korniienko_drawing_path and os.path.exists(korniienko_drawing_path):
-            img = Image.open(korniienko_drawing_path).convert('RGB')  # Convert to RGB even if grayscale
-            if self.transform:
-                img = self.transform(img)
-            korniienko_drawing_tensor = img
-        else:
-            # Create blank if missing
-            korniienko_drawing_tensor = torch.zeros(3, self.image_size, self.image_size)
+        def load_aug(path):
+            if path is None:
+                return torch.zeros(3, h, w)
+            t = self._load_image(path, True)
+            if self.geometric is not None:
+                t = self.geometric(t)
+            return self._normalize(t)
         
-        # Prepare output
         return {
-            'rti_images': rti_tensor,  # [12, H, W]
-            'korniienko_photo': korniienko_photo_tensor,  # [3, H, W]
-            'korniienko_drawing': korniienko_drawing_tensor,  # [3, H, W]
+            'rti_images': rti_tensor,                       # [12, H, W]
+            'korniienko_photo': load_aug(photo_path),       # [3, H, W]
+            'korniienko_drawing': load_aug(drawing_path),   # [3, H, W]
+            'rti_present': rti_present,
+            'photo_present': photo_path is not None,
+            'drawing_present': drawing_path is not None,
             'input_ids': torch.tensor(encoded['input_ids'], dtype=torch.long),
             'attention_mask': torch.tensor(encoded['attention_mask'], dtype=torch.long),
             'language': self.language_to_idx.get(row.get('language_name', 'unknown'), 0),
@@ -429,109 +448,29 @@ class SophiaMultiModalDataset(Dataset):
             'transcription': transcription,
             'isialy_id': isialy_id
         }
-    
-    def _load_rti_images(self, isialy_id):
-        """Load and stack RTI images (4 types × 3 RGB = 12 channels)."""
-        rti_dir = self.data_dir / 'data' / 'cropped_images_hq' / self.split
-        rti_types = ['original', 'blended', 'normal', 'texture']
-        
-        channels = []
-        for img_type in rti_types:
-            img_path = rti_dir / img_type / f"{isialy_id}_{img_type}.png"
-            
-            if img_path.exists():
-                img = Image.open(img_path).convert('RGB')
-                img_tensor = self.transform(img)  # [3, H, W]
-            else:
-                # Create blank image if missing
-                img_tensor = torch.zeros(3, self.image_size, self.image_size)
-            
-            channels.append(img_tensor)
-        
-        # Stack to create [12, H, W]
-        rti_tensor = torch.cat(channels, dim=0)
-        return rti_tensor
-    
-    def _load_korniienko_images(self, row):
-        """Load Korniienko photo and drawing from CSV paths."""
-        photo_tensor = None
-        drawing_tensor = None
-        
-        # Load photo if path exists in CSV
-        photo_path_str = row.get('korniienko_photo', '')
-        if not pd.isna(photo_path_str) and photo_path_str:
-            photo_path = self.data_dir / 'data' / photo_path_str
-            if photo_path.exists():
-                try:
-                    photo = Image.open(photo_path).convert('RGB')
-                    photo_tensor = self.transform(photo)
-                except Exception as e:
-                    print(f"Warning: Failed to load photo {photo_path}: {e}")
-                    photo_tensor = None
-        
-        # Load drawing if path exists in CSV
-        drawing_path_str = row.get('korniienko_drawing', '')
-        if not pd.isna(drawing_path_str) and drawing_path_str:
-            drawing_path = self.data_dir / 'data' / drawing_path_str
-            if drawing_path.exists():
-                try:
-                    drawing = Image.open(drawing_path).convert('RGB')
-                    drawing_tensor = self.transform(drawing)
-                except Exception as e:
-                    print(f"Warning: Failed to load drawing {drawing_path}: {e}")
-                    drawing_tensor = None
-        
-        return photo_tensor, drawing_tensor
 
 
 def collate_fn(batch):
-    """Custom collate function to handle None values in Korniienko images."""
-    # Stack regular tensors
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    attention_mask = torch.stack([item['attention_mask'] for item in batch])
-    languages = torch.tensor([item['language'] for item in batch])
-    writing_systems = torch.tensor([item['writing_system'] for item in batch])
-    
-    result = {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask,
-        'language': languages,
-        'writing_system': writing_systems,
+    """Stack a list of dataset items into a batch."""
+    return {
+        'input_ids': torch.stack([item['input_ids'] for item in batch]),
+        'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
+        'language': torch.tensor([item['language'] for item in batch]),
+        'writing_system': torch.tensor([item['writing_system'] for item in batch]),
         'transcription': [item['transcription'] for item in batch],
-        'isialy_id': [item['isialy_id'] for item in batch]
+        'isialy_id': [item['isialy_id'] for item in batch],
+        'rti_images': torch.stack([item['rti_images'] for item in batch]),
+        'korniienko_photo': torch.stack([item['korniienko_photo'] for item in batch]),
+        'korniienko_drawing': torch.stack([item['korniienko_drawing'] for item in batch]),
+        'rti_present': torch.tensor([item['rti_present'] for item in batch], dtype=torch.bool),
+        'photo_present': torch.tensor([item['photo_present'] for item in batch], dtype=torch.bool),
+        'drawing_present': torch.tensor([item['drawing_present'] for item in batch], dtype=torch.bool),
     }
-    
-    # Handle RTI images
-    if 'rti_images' in batch[0]:
-        result['rti_images'] = torch.stack([item['rti_images'] for item in batch])
-    
-    # Handle Korniienko photo (replace None with zeros to maintain batch size)
-    if 'korniienko_photo' in batch[0]:
-        photos = []
-        for item in batch:
-            if item['korniienko_photo'] is not None:
-                photos.append(item['korniienko_photo'])
-            else:
-                # Create zero tensor with same shape as others
-                photos.append(torch.zeros(3, 224, 224))  # Assuming 224x224 images
-        result['korniienko_photo'] = torch.stack(photos)
-    
-    # Handle Korniienko drawing (replace None with zeros to maintain batch size)
-    if 'korniienko_drawing' in batch[0]:
-        drawings = []
-        for item in batch:
-            if item['korniienko_drawing'] is not None:
-                drawings.append(item['korniienko_drawing'])
-            else:
-                # Create zero tensor with same shape as others
-                drawings.append(torch.zeros(3, 224, 224))  # Assuming 224x224 images
-        result['korniienko_drawing'] = torch.stack(drawings)
-    
-    return result
 
 
 def create_model(model_type, vocab_size, num_languages, num_writing_systems, 
-                 use_korniienko=True):
+                 use_korniienko=True, max_length=256, pretrained=DEFAULT_TROCR,
+                 views=DEFAULT_VIEWS, gradient_checkpointing=False):
     """
     Create model instance based on type.
     
@@ -541,9 +480,7 @@ def create_model(model_type, vocab_size, num_languages, num_writing_systems,
         num_languages: Number of language classes
         num_writing_systems: Number of writing system classes
         use_korniienko: Whether to enable Korniienko support
-    
-    Returns:
-        model: PyTorch model instance
+        max_length: Maximum token sequence length
     """
     if model_type == 'multichannel':
         model = MultiChannelModel(
@@ -553,9 +490,9 @@ def create_model(model_type, vocab_size, num_languages, num_writing_systems,
             num_layers=8,
             num_languages=num_languages,
             num_writing_systems=num_writing_systems,
-            use_korniienko=use_korniienko
+            use_korniienko=use_korniienko,
+            max_length=max_length
         )
-        
     elif model_type == 'enhanced':
         model = EnhancedModel(
             vocab_size=vocab_size,
@@ -564,8 +501,12 @@ def create_model(model_type, vocab_size, num_languages, num_writing_systems,
             num_layers=8,
             num_languages=num_languages,
             num_writing_systems=num_writing_systems,
-            use_korniienko=use_korniienko
+            use_korniienko=use_korniienko,
+            max_length=max_length
         )
+    elif model_type == 'trocr':
+        model = SophiaTrOCRModel(pretrained=pretrained, views=views,
+                                 gradient_checkpointing=gradient_checkpointing)
         
     elif model_type == 'transformer':
         model = SophiaTransformerModel(
@@ -576,78 +517,78 @@ def create_model(model_type, vocab_size, num_languages, num_writing_systems,
             num_heads=8,
             num_languages=num_languages,
             num_writing_systems=num_writing_systems,
-            max_text_length=128
+            max_text_length=max_length
         )
-        
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, model_type, 
-                use_rti=True, use_korniienko=True):
-    """Train for one epoch."""
+def load_initial_weights(model, path):
+    """Load weights from a checkpoint (e.g. synthetic pretraining) before fine-tuning."""
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    state = checkpoint.get('model_state_dict', checkpoint)
+    own = model.state_dict()
+    compatible = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    skipped = sorted(set(state) - set(compatible))
+    model.load_state_dict(compatible, strict=False)
+    missing = sorted(set(own) - set(compatible))
+    print(f"✓ Initialised {len(compatible)}/{len(own)} tensors from {path}")
+    if skipped:
+        print(f"  skipped {len(skipped)} incompatible tensors, e.g. {skipped[:3]}")
+    if missing:
+        print(f"  {len(missing)} tensors keep their fresh initialisation, e.g. {missing[:3]}")
+
+
+def autocast_context(device, enabled):
+    """bf16 autocast on CUDA when --amp is given (no-op otherwise)."""
+    import contextlib
+    if enabled and str(device).startswith('cuda'):
+        return torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def _forward(model, batch, device, use_rti, use_korniienko, decoder_input, decoder_mask,
+             use_language=False, modality_dropout=0.0):
+    """Single forward call shared by all architectures."""
+    image_inputs = build_image_inputs(batch, device, use_rti, use_korniienko)
+    if modality_dropout > 0:
+        image_inputs = apply_modality_dropout(image_inputs, modality_dropout)
+    return model(
+        input_ids=decoder_input,
+        attention_mask=decoder_mask,
+        **language_inputs(batch, device, use_language),
+        **image_inputs
+    )
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device, model_type,
+                use_rti=True, use_korniienko=True, scheduler=None, use_language=False,
+                modality_dropout=0.0, amp=False, grad_accum=1):
+    """Train for one epoch with next-token prediction (targets shifted by one)."""
     model.train()
     total_loss = 0
     progress_bar = tqdm(dataloader, desc="Training")
     
-    for batch in progress_bar:
-        optimizer.zero_grad()
+    optimizer.zero_grad()
+    for step, batch in enumerate(progress_bar):
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        decoder_input, decoder_mask, target = shift_tokens(input_ids, attention_mask)
         
-        # Move to device
-        rti_images = batch['rti_images'].to(device)
-        korniienko_photo = batch['korniienko_photo'].to(device)
-        korniienko_drawing = batch['korniienko_drawing'].to(device)
-        text_indices = batch['input_ids'].to(device)  # Use input_ids from collate_fn
-        text_mask = batch['attention_mask'].to(device)  # Use attention_mask from collate_fn
+        with autocast_context(device, amp):
+            logits = _forward(model, batch, device, use_rti, use_korniienko,
+                              decoder_input, decoder_mask, use_language, modality_dropout)
+            loss = criterion(logits.float().reshape(-1, logits.size(-1)), target.reshape(-1))
         
-        # Prepare images
-        kwargs = {}
-        if use_rti and 'rti_images' in batch:
-            kwargs['images'] = batch['rti_images'].to(device)
-        
-        if use_korniienko:
-            if batch.get('korniienko_photo') is not None:
-                kwargs['korniienko_photo'] = batch['korniienko_photo'].to(device)
-            
-            if batch.get('korniienko_drawing') is not None:
-                kwargs['korniienko_drawing'] = batch['korniienko_drawing'].to(device)
-        
-        # Forward pass - different models have different signatures
-        if model_type == 'transformer':
-            # Transformer uses different parameter names and returns a dict
-            outputs = model(
-                rti_images=rti_images,
-                korniienko_photo=korniienko_photo,
-                korniienko_drawing=korniienko_drawing,
-                text_indices=text_indices,
-                text_mask=text_mask,
-                training=True
-            )
-            logits = outputs['transcription_logits']
-        else:
-            # Enhanced and MultiChannel models
-            logits = model(
-                input_ids=text_indices,
-                attention_mask=text_mask,
-                images=rti_images,
-                languages=batch.get('language'),
-                writing_systems=batch.get('writing_system'),
-                korniienko_photo=korniienko_photo,
-                korniienko_drawing=korniienko_drawing
-            )
-        
-        # Compute loss
-        loss = criterion(
-            logits.view(-1, logits.size(-1)),
-            text_indices.view(-1)
-        )
-        
-        # Backward pass
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        (loss / grad_accum).backward()
+        if (step + 1) % grad_accum == 0 or step + 1 == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            if scheduler is not None:
+                scheduler.step()  # per optimizer step
         
         total_loss += loss.item()
         progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
@@ -656,54 +597,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device, model_type,
 
 
 def validate(model, dataloader, criterion, device, model_type,
-             use_rti=True, use_korniienko=True):
-    """Validate model."""
+             use_rti=True, use_korniienko=True, use_language=False, amp=False):
+    """Validation loss with next-token prediction (targets shifted by one)."""
     model.eval()
     total_loss = 0
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validation"):
-            # Move to device
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
-            languages = batch['language'].to(device)
-            writing_systems = batch['writing_system'].to(device)
+            decoder_input, decoder_mask, target = shift_tokens(input_ids, attention_mask)
             
-            # Prepare images
-            kwargs = {}
-            if use_rti and 'rti_images' in batch:
-                kwargs['images'] = batch['rti_images'].to(device)
-            
-            if use_korniienko:
-                if batch.get('korniienko_photo') is not None:
-                    kwargs['korniienko_photo'] = batch['korniienko_photo'].to(device)
-                
-                if batch.get('korniienko_drawing') is not None:
-                    kwargs['korniienko_drawing'] = batch['korniienko_drawing'].to(device)
-            
-            # Forward pass
-            if model_type == 'transformer':
-                kwargs['text_indices'] = input_ids
-                kwargs['text_mask'] = attention_mask
-                if 'images' in kwargs:
-                    kwargs['rti_images'] = kwargs.pop('images')
-                outputs = model(**kwargs)
-                logits = outputs['transcription_logits']
-            else:
-                logits = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    languages=languages,
-                    writing_systems=writing_systems,
-                    **kwargs
-                )
-            
-            # Compute loss
-            loss = criterion(
-                logits.view(-1, logits.size(-1)),
-                input_ids.view(-1)
-            )
-            
+            with autocast_context(device, amp):
+                logits = _forward(model, batch, device, use_rti, use_korniienko,
+                                  decoder_input, decoder_mask, use_language)
+            loss = criterion(logits.float().reshape(-1, logits.size(-1)), target.reshape(-1))
             total_loss += loss.item()
     
     return total_loss / len(dataloader)
@@ -728,8 +636,22 @@ Examples:
     
     # Model selection
     parser.add_argument('--model', type=str, required=True,
-                        choices=['multichannel', 'enhanced', 'transformer'],
-                        help='Model architecture to train')
+                        choices=['multichannel', 'enhanced', 'transformer', 'trocr'],
+                        help='Model architecture to train (trocr = pretrained TrOCR, fine-tuned)')
+    parser.add_argument('--pretrained', type=str, default=DEFAULT_TROCR,
+                        help='Hugging Face id or local path of the TrOCR checkpoint (model=trocr)')
+    parser.add_argument('--views', type=str, default=','.join(DEFAULT_VIEWS),
+                        help='TrOCR input views, comma-separated, from '
+                             'original,blended,normal,texture,photo,drawing')
+    parser.add_argument('--init_from', type=str, default=None,
+                        help='Initialise weights from a checkpoint (e.g. after synthetic pretraining)')
+    parser.add_argument('--modality_dropout', type=float, default=0.0,
+                        help='Training: hide each available modality with this probability')
+    parser.add_argument('--keep_aspect', action='store_true',
+                        help='Letterbox images instead of stretching them')
+    parser.add_argument('--amp', action='store_true', help='bf16 mixed precision on CUDA')
+    parser.add_argument('--gradient_checkpointing', action='store_true',
+                        help='Trade compute for memory (model=trocr)')
     
     # Data configuration
     parser.add_argument('--data_dir', type=str, 
@@ -755,17 +677,21 @@ Examples:
                         help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=6,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=None,
                         help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.01,
                         help='Weight decay')
-    parser.add_argument('--image_size', type=int, default=224,
-                        help='Input image size')
-    parser.add_argument('--max_length', type=int, default=128,
-                        help='Maximum text sequence length')
+    parser.add_argument('--image_size', type=int, nargs='+', default=None,
+                        help='Input image size: one value (square) or HEIGHT WIDTH, '
+                             'e.g. 128 512 for line-shaped inscriptions')
+    parser.add_argument('--max_length', type=int, default=256,
+                        help='Maximum token sequence length (incl. SOS/EOS)')
+    parser.add_argument('--use_language', action='store_true',
+                        help='Condition the decoder on the gold language / writing system '
+                             '(off by default: baselines do not get this information)')
     
     # Tokenizer selection
-    parser.add_argument('--tokenizer', type=str, default='xlm',
+    parser.add_argument('--tokenizer', type=str, default='character',
                         choices=['xlm', 'character'],
                         help='Tokenizer type: xlm (XLM-RoBERTa) or character (character-level)')
     
@@ -782,7 +708,7 @@ Examples:
                         help='Checkpoint directory')
     parser.add_argument('--log_interval', type=int, default=10,
                         help='Logging interval (batches)')
-    parser.add_argument('--save_interval', type=int, default=1,
+    parser.add_argument('--save_interval', type=int, default=0,
                         help='Save checkpoint every N epochs')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint')
@@ -790,10 +716,18 @@ Examples:
     # Miscellaneous
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
+    parser.add_argument('--device', type=str, default=default_device(),
                         help='Device to use')
     
     args = parser.parse_args()
+    if args.image_size is None:
+        args.image_size = [384] if args.model == 'trocr' else [224]
+    args.image_size = args.image_size[0] if len(args.image_size) == 1 else args.image_size[:2]
+    if args.lr is None:
+        args.lr = 3e-5 if args.model == 'trocr' else 1e-4
+    args.views = [v.strip() for v in args.views.split(',') if v.strip()]
+    if args.model == 'trocr':
+        args.tokenizer = 'trocr'
     
     # Handle modality flags (default to both enabled if neither specified)
     if not args.use_rti and not args.no_rti and not args.use_korniienko and not args.no_korniienko:
@@ -833,7 +767,8 @@ Examples:
     print(f"   Epochs: {args.epochs}")
     print(f"   Batch Size: {args.batch_size}")
     print(f"   Learning Rate: {args.lr}")
-    print(f"   Image Size: {args.image_size}×{args.image_size}")
+    print(f"   Image Size: {args.image_size}")
+    print(f"   Language conditioning: {'✓' if args.use_language else '✗'}")
     print(f"   Max Text Length: {args.max_length}")
     print(f"\n Data:")
     print(f"   Base Dir: {args.data_dir}")
@@ -855,26 +790,9 @@ Examples:
     
     # Initialize tokenizer
     print("\n Initializing tokenizer...")
-    if args.tokenizer == 'character':
-        tokenizer = CharacterTokenizer()
-        vocab_size = tokenizer.vocab_size
-        print(f"✓ Character-level tokenizer loaded (vocab size: {vocab_size})")
-        print(f"  ✓ Preserves all ancient Cyrillic characters (ꙗ, ꙅ, ѧ, etc.)")
-    else:  # xlm
-        if XLMRobertaTokenizer is not None:
-            try:
-                tokenizer = XLMRobertaTokenizer.from_pretrained('xlm-roberta-base')
-                vocab_size = tokenizer.vocab_size
-                print(f"✓ XLM-RoBERTa tokenizer loaded (vocab size: {vocab_size})")
-                print(f"  Warning: May corrupt ancient Cyrillic characters")
-            except:
-                print(" XLM-RoBERTa failed, falling back to character tokenizer")
-                tokenizer = CharacterTokenizer()
-                vocab_size = tokenizer.vocab_size
-        else:
-            print(" XLM-RoBERTa not available, using character tokenizer")
-            tokenizer = CharacterTokenizer()
-            vocab_size = tokenizer.vocab_size
+    tokenizer = build_tokenizer(args.model, args.tokenizer, args.pretrained)
+    vocab_size = tokenizer.vocab_size if not hasattr(tokenizer, '__len__') else len(tokenizer)
+    print(f"✓ Tokenizer: {type(tokenizer).__name__} (vocab size: {vocab_size})")
     
     # Create datasets
     print("\n Loading datasets...")
@@ -893,7 +811,8 @@ Examples:
         model_type=args.model,
         image_size=args.image_size,
         augment=True,
-        split='train'
+        split='train',
+        keep_aspect=args.keep_aspect
     )
     
     val_dataset = SophiaMultiModalDataset(
@@ -906,8 +825,12 @@ Examples:
         model_type=args.model,
         image_size=args.image_size,
         augment=False,
-        split='val'
+        split='val',
+        keep_aspect=args.keep_aspect
     )
+    
+    # Use the training mappings for validation so language indices agree
+    val_dataset.language_to_idx, val_dataset.ws_to_idx = train_dataset.language_to_idx, train_dataset.ws_to_idx
     
     print(f"\n✓ Training samples: {len(train_dataset)}")
     print(f"✓ Validation samples: {len(val_dataset)}")
@@ -939,8 +862,15 @@ Examples:
         vocab_size=vocab_size,
         num_languages=train_dataset.num_languages,
         num_writing_systems=train_dataset.num_writing_systems,
-        use_korniienko=args.use_korniienko
+        use_korniienko=args.use_korniienko,
+        max_length=args.max_length,
+        pretrained=args.pretrained,
+        views=args.views,
+        gradient_checkpointing=args.gradient_checkpointing
     )
+    
+    if args.init_from:
+        load_initial_weights(model, args.init_from)
     
     model = model.to(args.device)
     
@@ -958,14 +888,15 @@ Examples:
         weight_decay=args.weight_decay
     )
     
-    criterion = nn.CrossEntropyLoss(ignore_index=0)  # Ignore padding token
+    _, _, pad_id = get_special_ids(tokenizer)
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_id)  # Ignore padding token
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=args.lr,
         epochs=args.epochs,
-        steps_per_epoch=len(train_loader),
+        steps_per_epoch=max(1, -(-len(train_loader) // args.gradient_accumulation)),
         pct_start=0.1
     )
     
@@ -994,17 +925,17 @@ Examples:
         # Train
         train_loss = train_epoch(
             model, train_loader, optimizer, criterion, args.device,
-            args.model, args.use_rti, args.use_korniienko
+            args.model, args.use_rti, args.use_korniienko, scheduler=scheduler,
+            use_language=args.use_language, modality_dropout=args.modality_dropout,
+            amp=args.amp, grad_accum=args.gradient_accumulation
         )
         
         # Validate
         val_loss = validate(
             model, val_loader, criterion, args.device,
-            args.model, args.use_rti, args.use_korniienko
+            args.model, args.use_rti, args.use_korniienko,
+            use_language=args.use_language, amp=args.amp
         )
-        
-        # Update scheduler
-        scheduler.step()
         
         # Print metrics
         print(f"\n Epoch {epoch + 1} Results:")
@@ -1013,10 +944,10 @@ Examples:
         print(f"   LR:         {scheduler.get_last_lr()[0]:.6f}")
         
         # Save checkpoint
-        if (epoch + 1) % args.save_interval == 0 or val_loss < best_val_loss:
+        if (args.save_interval and (epoch + 1) % args.save_interval == 0) or val_loss < best_val_loss:
             checkpoint_path = checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pt'
-            
-            torch.save({
+            if args.save_interval and (epoch + 1) % args.save_interval == 0:
+              torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -1032,8 +963,7 @@ Examples:
                 'idx_to_ws': train_dataset.idx_to_ws,
                 'vocab_size': vocab_size
             }, checkpoint_path)
-            
-            print(f" Checkpoint saved: {checkpoint_path}")
+              print(f" Checkpoint saved: {checkpoint_path}")
             
             # Save best model
             if val_loss < best_val_loss:
