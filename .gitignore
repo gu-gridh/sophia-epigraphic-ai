@@ -239,3 +239,14 @@ nohup.out
 /presentation/
 /Reviewer.txt
 /rebuttal_experiments.log
+
+# ICDAR 2026 paper: sources, revisions, poster, slides and author kits
+/ICDAR2026/
+/icdar/
+/author-kit-*/
+/sophia_ai_package*/
+/sophia_ai_method_icdar*.html
+/Revision*
+/Abstract improvement tips.html
+/Compute_details.pdf
+/poster.pdf
