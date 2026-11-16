@@ -152,83 +152,90 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
-saintsophia-backend/saintsophia/settings_local.py
-configs
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
 
-# Data folder and files
-#  This is a general rule for ignoring data files and directories.
-#  Adjust the patterns as needed for your project.
-#  For example, if you have a specific data directory or file types you want to ignore
+# ---------------------------------------------------------------------------
+# Saint Sophia epigraphic AI: never commit data, models, results or private notes
+# ---------------------------------------------------------------------------
 
-# SOPHIA Training Data - exclude large datasets from git
-sophia-epigraphic-ai/data/
-sophia-epigraphic-ai/checkpoints/
-sophia-epigraphic-ai/logs/
-sophia-epigraphic-ai/runs/
-sophia-epigraphic-ai/wandb/
-
-# Original inscription images and annotations (too large for git)
+# Datasets (API exports, crops, Korniienko images, synthetic renders, CV folds)
+/data/
+/datasets/
+/processed/
+/raw/
 original/
 inscriptions_annotations/
-data/
-
-# Dataset files - keep structure but exclude large data
+/inscriptions_graffiti_cleaned.csv
 *.csv
 *.tsv
-*.json
-*.xml
-*.yaml
 
-# Model files and training outputs
-*.pth
+# Model checkpoints and weights
+/checkpoints/
+/checkpoints_*/
 *.pt
+*.pth
 *.ckpt
 *.h5
+*.safetensors
 *.pkl
 *.pickle
 
-# Image files
+# Training / evaluation outputs
+/logs/
+/logs_*/
+/runs/
+/wandb/
+/evaluation_results/
+/baselines/
+*.log
+nohup.out
+
+# Images, video, archives, installers
 *.jpg
 *.jpeg
 *.png
 *.bmp
-*.tiff
 *.tif
+*.tiff
 *.gif
-
-# Video files  
 *.mp4
 *.avi
 *.mov
 *.mkv
-
-# Archive files
 *.zip
 *.tar.gz
 *.rar
 *.7z
+*.rpm
+*.deb
 
-# Large temporary files
+# JSON / XML / YAML are mostly generated outputs (metrics, configs per run).
+# environment.yml (.yml) stays tracked; add exceptions below for JSON that is code.
+*.json
+*.xml
+*.yaml
+!/configs/*.json
+
+# Local backups, scratch copies and temporary files
+/_backup*/
+/scripts/_backup*/
+/_github_*/
+*.bak
+*.orig
 *.tmp
 *.temp
-*.log
 
-# Data directories, results, papers, presentation and checkpoints
-.data
-data/*
-datasets/
-processed/
-raw/
-Papers/
-checkpoints/
-logs/
-evaluation_results/
-frontend/
-presentation/
-baselines/
+# Separate projects / clones living inside this folder
+/main_portal/
+/frontend/
+
+# Papers, presentations and private notes (reviews, submission plans)
+/Papers/
+/presentation/
+/Reviewer.txt
+/rebuttal_experiments.log
